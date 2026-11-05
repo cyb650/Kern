@@ -284,6 +284,7 @@ set(APP_PAGE_SOURCES
     ${APP_PAGES_DIR}/load_mnemonic/load_storage.c
     ${APP_PAGES_DIR}/load_mnemonic/manual_input.c
     ${APP_PAGES_DIR}/load_mnemonic/word_numbers_input.c
+    ${APP_PAGES_DIR}/load_mnemonic/load_base10.c
     # New mnemonic
     ${APP_PAGES_DIR}/new_mnemonic/new_mnemonic_menu.c
     ${APP_PAGES_DIR}/new_mnemonic/dice_rolls.c
@@ -297,6 +298,7 @@ set(APP_PAGE_SOURCES
     ${APP_PAGES_DIR}/home/backup/backup_menu.c
     ${APP_PAGES_DIR}/home/backup/mnemonic_qr.c
     ${APP_PAGES_DIR}/home/backup/mnemonic_words.c
+    ${APP_PAGES_DIR}/home/backup/mnemonic_base10.c
     # Settings
     ${APP_PAGES_DIR}/settings/descriptor_manager.c
     ${APP_PAGES_DIR}/settings/wallet_settings.c

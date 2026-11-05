@@ -9,6 +9,7 @@
 #include "../../store_mnemonic.h"
 #include "mnemonic_qr.h"
 #include "mnemonic_words.h"
+#include "mnemonic_base10.h"
 #include <lvgl.h>
 
 static ui_menu_t *backup_menu = NULL;
@@ -78,6 +79,21 @@ static void menu_save_sd_cb(void) {
   store_mnemonic_page_show();
 }
 
+/* --- Save Base10 (Encrypted Base10 Handler) --- */
+static void return_from_mnemonic_base10_cb(void) {
+  mnemonic_base10_page_destroy();
+  backup_menu_page_show();
+}
+
+static void menu_save_base10_cb(void) {
+  backup_menu_page_hide();
+  mnemonic_base10_page_create(lv_screen_active(), return_from_mnemonic_base10_cb);
+  mnemonic_base10_page_show();
+}
+
+
+
+
 /* --- Back --- */
 
 static void back_cb(void) {
@@ -105,6 +121,8 @@ void backup_menu_page_create(lv_obj_t *parent, void (*return_cb)(void)) {
                               menu_save_flash_cb);
   ui_menu_add_entry_with_icon(backup_menu, ICON_SD_CARD, "Save to SD",
                               menu_save_sd_cb);
+  ui_menu_add_entry_with_icon(backup_menu, LV_SYMBOL_EDIT, "Base10",
+                              menu_save_base10_cb);
 }
 
 void backup_menu_page_show(void) {

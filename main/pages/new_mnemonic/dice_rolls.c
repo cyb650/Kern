@@ -246,6 +246,18 @@ static void show_finish_prompt(void) {
     return;
   }
 
+  // --- ТОЧЕЧНЫЙ ОТЛАДОЧНЫЙ ПРИНТ СЮДА ---
+  printf("\n=== DICE ROLLS QUALITY DEBUG ===\n");
+  printf("Raw Rolls String:  %s\n", rolls_string);
+  printf("Total Rolls Count: %d (Minimum required: %d)\n", rolls_count, min_rolls);
+  printf("Target Entropy:    %u bits\n", target_estimated_entropy);
+  printf("Estimated Entropy: %.4f bits\n", quality.estimated_entropy_bits);
+  printf("Status Flags:\n");
+  printf("  -> Low Entropy?  %s\n", quality.low_estimated_entropy ? "YES (Bad)" : "NO (OK)");
+  printf("  -> Pattern?      %s\n", quality.pattern_detected ? "YES (Bad)" : "NO (OK)");
+  printf("================================\n\n");
+  // --------------------------------------
+
   if (quality.low_estimated_entropy || quality.pattern_detected) {
     const char *warning;
     if (quality.low_estimated_entropy && quality.pattern_detected) {
@@ -262,9 +274,17 @@ static void show_finish_prompt(void) {
     return;
   }
 
+#if 0
   char message[64];
   snprintf(message, sizeof(message), "Generate %d-word mnemonic from %d rolls?",
            total_words, rolls_count);
+#else
+  char message[128];
+  snprintf(message, sizeof(message), 
+           "Entropy: %.1f bits (OK)\n\nGenerate %d-word mnemonic from %d rolls?",
+           quality.estimated_entropy_bits, total_words, rolls_count);
+#endif
+
   dialog_show_confirm(message, confirm_finish_cb, NULL, DIALOG_STYLE_OVERLAY);
 }
 

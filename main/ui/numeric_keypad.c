@@ -89,8 +89,23 @@ static bool parse_value(const ui_numeric_keypad_t *keypad,
     value = value * 10 + digit;
   }
 
+#if 0
   if (value < keypad->config.min_value)
     return false;
+#else
+  if (keypad->config.max_digits > 0 && keypad->input_len == keypad->config.max_digits) {
+    // Длина идеальна — пропускаем проверку диапазона вниз!
+  } else {
+    // В остальных случаях (если длина еще не набрана) штатно проверяем минимум автора
+    if (value < keypad->config.min_value)
+      return false;
+  }
+  // Если у нас задано ограничение на количество цифр, и пользователь набрал МЕНЬШЕ, 
+  // мы возвращаем false. Клавиатура не закроется, а выведет ошибку "Enter ALL digits!"
+  if (keypad->config.max_digits > 0 && keypad->input_len < keypad->config.max_digits) {
+    return false;
+  }
+#endif
 
   *value_out = value;
   return true;

@@ -354,3 +354,56 @@ void dialog_show_message(const char *title, const char *message) {
   lv_obj_set_size(btn, theme_button_width(), theme_button_height());
   lv_obj_add_event_cb(btn, message_close_cb, LV_EVENT_CLICKED, modal);
 }
+
+
+
+void dialog_show_success_timeout(const char *message,
+                                 dialog_simple_callback_t callback,
+                                 int timeout_ms) {
+  if (!message)
+    return;
+
+  if (timeout_ms <= 0)
+    timeout_ms = 1500; // По умолчанию делаем приятные 1.5 секунды
+
+  lv_obj_t *modal = lv_obj_create(lv_screen_active());
+  dialog_context_t *ctx = dialog_context_create(modal);
+  if (!ctx) {
+    lv_obj_delete(modal);
+    return;
+  }
+  ctx->callback.error = callback;
+
+  lv_obj_set_size(modal, LV_PCT(80), LV_PCT(60)); // Сделаем коробочку чуть компактнее
+  lv_obj_center(modal);
+  theme_apply_frame(modal);
+
+  int32_t gap = theme_small_padding();
+
+  // Зеленый заголовок "Success"
+  lv_obj_t *title = theme_create_label(modal, "Success", false);
+  theme_apply_label(title, true);
+  lv_obj_set_style_text_color(title, encourage_color(), 0); 
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, gap);
+
+  // Текст сообщения, покрашенный в зеленый encourage_color() кошелька
+  lv_obj_t *success_lbl = theme_create_label(modal, message, false);
+  theme_apply_label(success_lbl, false);
+  lv_obj_set_style_text_color(success_lbl, encourage_color(), 0);
+  lv_obj_set_width(success_lbl, LV_PCT(90));
+  lv_label_set_long_mode(success_lbl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(success_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(success_lbl, LV_ALIGN_CENTER, 0, 0);
+
+  // Нижняя подсказка
+  lv_obj_t *hint = theme_create_label(modal, "Continuing...", false);
+  theme_apply_label(hint, false);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -gap);
+
+  // Используем тот же самый таймер автора, который закроет окно и вызовет коллбэк
+  ctx->timer = lv_timer_create(error_timer_cb, timeout_ms, ctx);
+  if (ctx->timer)
+    lv_timer_set_repeat_count(ctx->timer, 1);
+  else
+    lv_obj_delete(modal);
+}

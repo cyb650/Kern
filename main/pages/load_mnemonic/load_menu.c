@@ -14,6 +14,7 @@
 #include "load_storage.h"
 #include "manual_input.h"
 #include "word_numbers_input.h"
+#include "load_base10.h"
 #include <lvgl.h>
 #include <stdlib.h>
 
@@ -205,6 +206,18 @@ static void from_sd_cb(void) {
   load_storage_page_show();
 }
 
+static void return_from_base10_cb(void) {
+  load_base10_page_destroy();
+  load_menu_page_show();
+}
+
+static void from_base10_cb(void) {
+  load_menu_page_hide();
+  load_base10_page_create(lv_screen_active(), return_from_base10_cb);
+  load_base10_page_show();
+}
+
+
 static void back_cb(void) {
   void (*callback)(void) = return_callback;
   load_menu_page_hide();
@@ -232,6 +245,8 @@ void load_menu_page_create(lv_obj_t *parent, void (*return_cb)(void)) {
                               from_flash_cb);
   ui_menu_add_entry_with_icon(load_menu, ICON_SD_CARD, "From SD Card",
                               from_sd_cb);
+  ui_menu_add_entry_with_icon(load_menu, LV_SYMBOL_EDIT, "From Base10",
+                              from_base10_cb);
   ui_menu_show(load_menu);
 }
 

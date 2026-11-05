@@ -55,4 +55,10 @@ void dialog_show_message(const char *title, const char *message);
 lv_obj_t *dialog_show_progress(const char *title, const char *message,
                                dialog_style_t style);
 
+                               
+
+void dialog_show_success_timeout(const char *message,
+                                 dialog_simple_callback_t callback,
+                                 int timeout_ms);
+
 #endif

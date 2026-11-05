@@ -1,27 +1,29 @@
 #include "registry.h"
+#include "../utils/secure_mem.h"
+#include "bip138_backup.h"
 #include "bip32_path.h"
 #include "descriptor_checksum.h"
+#include "descriptor_validator.h"
 #include "key.h"
+#include "psbt_internal.h"
 #include "wallet.h"
 #include <esp_log.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wally_address.h>
 #include <wally_bip32.h>
+#include <wally_crypto.h>
 #include <wally_descriptor.h>
 
 static const char *TAG = "registry";
 
 static registry_entry_t registry_entries[REGISTRY_MAX_ENTRIES];
 static size_t registry_len = 0;
-
-/* Descriptor registration is intentionally disabled for now. Descriptor
- * storage stays available as explicit backup/import, but boot must not treat
- * stored descriptor files as the durable registry until backups are encrypted
- * to the descriptor's own public keys (bitcoin/bips#1951). */
-#define REGISTRY_AUTOLOAD_DESCRIPTORS 0
+static size_t registry_rejected = 0;
 
 size_t registry_count(void) { return registry_len; }
+
+size_t registry_rejected_count(void) { return registry_rejected; }
 
 const registry_entry_t *registry_get(size_t i) {
   if (i >= registry_len)
@@ -51,34 +53,13 @@ bool registry_set_label(const char *id, const char *label) {
   return false;
 }
 
-bool registry_remove(const char *id) {
-  if (!id)
+bool registry_remove_at(size_t idx) {
+  if (idx >= registry_len)
     return false;
-  size_t idx = registry_len; // sentinel: "not found"
-  for (size_t i = 0; i < registry_len; i++) {
-    if (strncmp(registry_entries[i].id, id, REGISTRY_ID_MAX_LEN) == 0) {
-      idx = i;
-      break;
-    }
-  }
-  if (idx == registry_len) {
-    ESP_LOGE(TAG, "registry_remove: id '%s' not found", id);
-    return false;
-  }
 
   if (registry_entries[idx].desc != NULL) {
     wally_descriptor_free(registry_entries[idx].desc);
     registry_entries[idx].desc = NULL;
-  }
-
-  esp_err_t err = ESP_OK;
-  if (registry_entries[idx].persisted) {
-    err = storage_delete_descriptor(registry_entries[idx].loc,
-                                    registry_entries[idx].id);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "registry_remove: storage_delete_descriptor failed (%d)",
-               err);
-    }
   }
 
   if (idx < registry_len - 1) {
@@ -89,7 +70,22 @@ bool registry_remove(const char *id) {
   memset(&registry_entries[registry_len - 1], 0, sizeof(registry_entry_t));
   registry_len--;
 
-  return (err == ESP_OK);
+  return true;
+}
+
+bool registry_deregister_at(size_t idx) {
+  if (idx >= registry_len || !registry_entries[idx].persisted)
+    return false;
+  registry_entry_t *entry = &registry_entries[idx];
+  char filename[64];
+  storage_descriptor_filename(entry->loc, entry->id, STORAGE_DESCRIPTOR_BIP138,
+                              filename, sizeof(filename));
+  esp_err_t err = storage_delete_descriptor(entry->loc, filename);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "De-registering '%s' failed (%d)", entry->id, err);
+    return false;
+  }
+  return registry_remove_at(idx);
 }
 
 void registry_clear(void) {
@@ -102,75 +98,182 @@ void registry_clear(void) {
   registry_len = 0;
 }
 
-static void registry_init_scan(storage_location_t loc) {
+static bool descriptor_id_from_filename(const char *fname, char *id,
+                                        size_t id_size) {
+  const char *start = fname;
+  size_t prefix_len = strlen(STORAGE_DESCRIPTOR_PREFIX);
+  if (strncmp(start, STORAGE_DESCRIPTOR_PREFIX, prefix_len) == 0)
+    start += prefix_len;
+  const char *ext = STORAGE_DESCRIPTOR_EXT_BIP138;
+  size_t slen = strlen(start);
+  size_t elen = strlen(ext);
+  if (slen <= elen || strcmp(start + slen - elen, ext) != 0)
+    return false;
+  size_t id_len = slen - elen;
+  if (id_len >= id_size)
+    id_len = id_size - 1;
+  memcpy(id, start, id_len);
+  id[id_len] = '\0';
+  return true;
+}
+
+/* Counts failures for the user, except a registration for the other network,
+ * which a network switch makes expected. */
+static bool scan_validate(const char *descriptor_str,
+                          struct wally_descriptor **desc, int *key_index) {
+  descriptor_validation_result_t result =
+      descriptor_validate_keyed_parsed(descriptor_str, desc, key_index);
+  if (result != VALIDATION_SUCCESS && result != VALIDATION_NETWORK_MISMATCH)
+    registry_rejected++;
+  return result == VALIDATION_SUCCESS;
+}
+
+/* Registers every flash backup that this device wrote for the loaded key
+ * (valid approval mark) and that still passes keyed validation. Backups
+ * without a mark, plaintext and KEF files stay explicit imports. Each backup
+ * is parsed once, by the validator, and handed to the registry as parsed. */
+static void registry_init_scan(void) {
   char **files = NULL;
   int count = 0;
-  if (storage_list_descriptors(loc, &files, &count) != ESP_OK) {
+  if (storage_list_descriptors(STORAGE_FLASH, &files, &count) != ESP_OK)
     return;
-  }
-  for (int i = 0; i < count; i++) {
+  bip138_backup_hold_approval_key();
+  for (int i = 0; i < count && registry_len < REGISTRY_MAX_ENTRIES; i++) {
     const char *fname = files[i];
-    size_t flen = strlen(fname);
-    if (flen < 4 || strcmp(fname + flen - 4, ".txt") != 0) {
+    if (storage_descriptor_format(fname) != STORAGE_DESCRIPTOR_BIP138)
       continue;
-    }
     uint8_t *data = NULL;
     size_t data_len = 0;
-    bool encrypted = false;
-    if (storage_load_descriptor(loc, fname, &data, &data_len, &encrypted) !=
-        ESP_OK) {
+    if (storage_load_descriptor(STORAGE_FLASH, fname, &data, &data_len, NULL) !=
+        ESP_OK)
       continue;
-    }
-    char *desc_str = malloc(data_len + 1);
-    if (desc_str) {
-      memcpy(desc_str, data, data_len);
-      desc_str[data_len] = '\0';
-      char id[REGISTRY_ID_MAX_LEN];
-      size_t id_len = flen - 4;
-      if (id_len >= REGISTRY_ID_MAX_LEN)
-        id_len = REGISTRY_ID_MAX_LEN - 1;
-      memcpy(id, fname, id_len);
-      id[id_len] = '\0';
-      if (!registry_add_from_string(id, desc_str, loc, false))
+    char *desc_str = NULL;
+    struct wally_descriptor *desc = NULL;
+    int key_index = -1;
+    char id[REGISTRY_ID_MAX_LEN];
+    char existing[REGISTRY_ID_MAX_LEN];
+    bool approved = false;
+    if (!bip138_backup_decrypt_any_hinted(data, data_len, &desc_str,
+                                          &approved)) {
+      ESP_LOGI(TAG, "Skipping '%s': not addressed to the loaded key", fname);
+    } else if (!approved) {
+      ESP_LOGI(TAG, "Skipping '%s': not registered on this device", fname);
+    } else if (!scan_validate(desc_str, &desc, &key_index)) {
+      ESP_LOGW(TAG, "Skipping '%s': failed validation", fname);
+    } else if (!descriptor_id_from_filename(fname, id, sizeof(id))) {
+      ESP_LOGW(TAG, "Skipping '%s': unexpected filename", fname);
+    } else if (registry_session_has_duplicate_scripts(desc, existing,
+                                                      sizeof(existing))) {
+      ESP_LOGI(TAG, "Skipping '%s': same descriptor as '%s'", fname, existing);
+    } else if (registry_find_by_id(id)) {
+      ESP_LOGW(TAG, "Skipping '%s': id '%s' already registered", fname, id);
+    } else {
+      bool added = registry_add_parsed(id, desc, (size_t)key_index,
+                                       STORAGE_FLASH, false);
+      desc = NULL; /* owned by the registry, or freed on failure */
+      if (added)
+        registry_entries[registry_len - 1].persisted = true;
+      else
         ESP_LOGW(TAG, "Skipping stored descriptor '%s': failed to register",
                  id);
-      free(desc_str);
     }
+    wally_descriptor_free(desc);
+    SECURE_FREE_STRING(desc_str);
     free(data);
   }
+  bip138_backup_release_approval_key();
   storage_free_file_list(files, count);
 }
 
 void registry_init(bool is_testnet) {
   (void)is_testnet;
   registry_clear();
-  if (REGISTRY_AUTOLOAD_DESCRIPTORS) {
-    registry_init_scan(STORAGE_FLASH);
-    registry_init_scan(STORAGE_SD);
-  }
+  registry_rejected = 0;
+  registry_init_scan();
   ESP_LOGI(TAG, "Registry: %zu entries loaded", registry_len);
 }
 
-/* Compute the h-normalized BIP-380 checksum of a descriptor string by parsing
- * it on either network. Caller frees via free. NULL on failure. */
-static char *descriptor_checksum_alloc(const char *descriptor_str) {
-  if (!descriptor_str)
-    return NULL;
-  uint32_t net = (wallet_get_network() == WALLET_NETWORK_MAINNET)
-                     ? WALLY_NETWORK_BITCOIN_MAINNET
-                     : WALLY_NETWORK_BITCOIN_TESTNET;
-  struct wally_descriptor *desc = NULL;
-  if (wallet_descriptor_parse(descriptor_str, NULL, net, &desc) != WALLY_OK) {
-    net = (net == WALLY_NETWORK_BITCOIN_MAINNET)
-              ? WALLY_NETWORK_BITCOIN_TESTNET
-              : WALLY_NETWORK_BITCOIN_MAINNET;
-    if (wallet_descriptor_parse(descriptor_str, NULL, net, &desc) != WALLY_OK)
-      return NULL;
+registry_wrapper_t
+registry_descriptor_wrapper(const struct wally_descriptor *desc) {
+  char *canon = NULL;
+  registry_wrapper_t wrapper = REGISTRY_WRAP_NONE;
+  if (desc &&
+      wally_descriptor_canonicalize(desc, WALLY_MS_CANONICAL_NO_CHECKSUM,
+                                    &canon) == WALLY_OK &&
+      canon) {
+    if (strncmp(canon, "sh(wsh(", 7) == 0)
+      wrapper = REGISTRY_WRAP_SH_WSH;
+    else if (strncmp(canon, "wsh(", 4) == 0)
+      wrapper = REGISTRY_WRAP_WSH;
+    else if (strncmp(canon, "sh(", 3) == 0)
+      wrapper = REGISTRY_WRAP_SH;
   }
-  char checksum[9];
-  bool ok = descriptor_checksum_from_descriptor(desc, checksum);
-  wally_descriptor_free(desc);
-  return ok ? strdup(checksum) : NULL;
+  wally_free_string(canon);
+  return wrapper;
+}
+
+uint32_t registry_wrapper_depth(registry_wrapper_t wrapper) {
+  switch (wrapper) {
+  case REGISTRY_WRAP_SH:
+  case REGISTRY_WRAP_WSH:
+    return 1;
+  case REGISTRY_WRAP_SH_WSH:
+    return 2;
+  case REGISTRY_WRAP_NONE:
+  default:
+    return 0;
+  }
+}
+
+/* Groups past this many add nothing a duplicate check needs. */
+#define SCRIPT_ID_MAX_GROUPS 4
+
+static bool script_id(const struct wally_descriptor *desc, uint8_t out[32]) {
+  uint32_t num_paths = 0;
+  if (wally_descriptor_get_num_paths(desc, &num_paths) != WALLY_OK)
+    return false;
+  uint32_t groups =
+      num_paths < SCRIPT_ID_MAX_GROUPS ? num_paths : SCRIPT_ID_MAX_GROUPS;
+  uint8_t buf[4 + SCRIPT_ID_MAX_GROUPS * 35];
+  size_t len = 4;
+  memcpy(buf, &num_paths, 4);
+  for (uint32_t mi = 0; mi < groups; mi++) {
+    /* Depth 0 builds the inner script here before hashing it. */
+    uint8_t spk[PSBT_MAX_INNER_SCRIPT_LEN];
+    size_t written = 0;
+    if (wally_descriptor_to_script(desc, 0, 0, 0, mi, 0, 0, spk, sizeof(spk),
+                                   &written) != WALLY_OK ||
+        written > 34)
+      return false;
+    buf[len++] = (uint8_t)written;
+    memcpy(buf + len, spk, written);
+    len += written;
+  }
+  return wally_sha256(buf, len, out, 32) == WALLY_OK;
+}
+
+static void set_script_id(registry_entry_t *e) {
+  e->has_script_id = script_id(e->desc, e->script_id);
+}
+
+bool registry_session_has_duplicate_scripts(const struct wally_descriptor *desc,
+                                            char *out_id, size_t out_id_size) {
+  if (out_id && out_id_size > 0)
+    out_id[0] = '\0';
+  uint8_t id[32];
+  if (!desc || !script_id(desc, id))
+    return false;
+  for (size_t i = 0; i < registry_len; i++) {
+    if (!registry_entries[i].has_script_id ||
+        memcmp(registry_entries[i].script_id, id, sizeof(id)) != 0)
+      continue;
+    if (out_id && out_id_size > 0) {
+      strncpy(out_id, registry_entries[i].id, out_id_size - 1);
+      out_id[out_id_size - 1] = '\0';
+    }
+    return true;
+  }
+  return false;
 }
 
 bool registry_session_has_duplicate(const char *descriptor_str, char *out_id,
@@ -179,89 +282,230 @@ bool registry_session_has_duplicate(const char *descriptor_str, char *out_id,
     out_id[0] = '\0';
   if (!descriptor_str)
     return false;
-
-  char *target = descriptor_checksum_alloc(descriptor_str);
-  if (!target)
+  uint32_t net = wallet_wally_network();
+  struct wally_descriptor *desc = NULL;
+  if (wallet_descriptor_parse(descriptor_str, NULL, net, &desc) != WALLY_OK &&
+      wallet_descriptor_parse(descriptor_str, NULL,
+                              wallet_wally_other_network(net),
+                              &desc) != WALLY_OK)
     return false;
-
   bool found =
-      registry_session_has_duplicate_checksum(target, out_id, out_id_size);
-  free(target);
+      registry_session_has_duplicate_scripts(desc, out_id, out_id_size);
+  wally_descriptor_free(desc);
   return found;
 }
 
-bool registry_session_has_duplicate_checksum(const char checksum[9],
-                                             char *out_id, size_t out_id_size) {
-  if (out_id && out_id_size > 0)
-    out_id[0] = '\0';
-  if (!checksum || checksum[0] == '\0')
-    return false;
-
-  bool found = false;
-  for (size_t i = 0; i < registry_len; i++) {
-    char entry_cksum[9];
-    if (registry_entries[i].desc &&
-        descriptor_checksum_from_descriptor(registry_entries[i].desc,
-                                            entry_cksum)) {
-      if (strcmp(entry_cksum, checksum) == 0) {
-        found = true;
-        if (out_id && out_id_size > 0) {
-          strncpy(out_id, registry_entries[i].id, out_id_size - 1);
-          out_id[out_id_size - 1] = '\0';
-        }
-      }
-      if (found)
-        break;
-    }
+/* Whether `tail` is `key`'s child path expanded at `multi_index`, taking the
+ * wildcard's value from `tail` itself. */
+static bool own_key_matches_tail(const registry_own_key_t *key,
+                                 uint32_t multi_index, const uint32_t *tail,
+                                 size_t tail_len, uint32_t *child_num) {
+  size_t len = strlen(key->child_path);
+  if (len == 0) {
+    *child_num = 0;
+    return tail_len == 0;
   }
 
-  return found;
+  uint32_t features = 0;
+  if (bip32_path_str_n_get_features(key->child_path, len, &features) !=
+          WALLY_OK ||
+      (features & BIP32_PATH_LEN_MASK) >> BIP32_PATH_LEN_SHIFT != tail_len)
+    return false;
+
+  uint32_t cn = 0;
+  if (features & BIP32_PATH_IS_WILDCARD) {
+    size_t pos =
+        (features & BIP32_PATH_WILDCARD_MASK) >> BIP32_PATH_WILDCARD_SHIFT;
+    if (pos >= tail_len || bip32_path_is_hardened(tail[pos]))
+      return false;
+    cn = tail[pos];
+  }
+
+  uint32_t expanded[MAX_KEYPATH_TOTAL_DEPTH];
+  size_t written = 0;
+  if (bip32_path_from_str_n(key->child_path, len, cn, multi_index,
+                            BIP32_FLAG_STR_WILDCARD | BIP32_FLAG_STR_BARE |
+                                BIP32_FLAG_STR_MULTIPATH,
+                            expanded, MAX_KEYPATH_TOTAL_DEPTH,
+                            &written) != WALLY_OK ||
+      written != tail_len ||
+      memcmp(expanded, tail, tail_len * sizeof(uint32_t)) != 0)
+    return false;
+  *child_num = cn;
+  return true;
+}
+
+static bool own_key_matches(const registry_own_key_t *key, uint32_t multi_index,
+                            const uint32_t *path, size_t depth,
+                            uint32_t *child_num) {
+  if (key->origin_path_len > depth ||
+      memcmp(key->origin_path, path, key->origin_path_len * sizeof(uint32_t)))
+    return false;
+  return own_key_matches_tail(key, multi_index, path + key->origin_path_len,
+                              depth - key->origin_path_len, child_num);
 }
 
 registry_entry_t *registry_match_keypath(const uint8_t *keypath,
-                                         size_t keypath_len, size_t *cursor) {
-  if (!keypath || !cursor)
+                                         size_t keypath_len,
+                                         registry_match_cursor_t *cursor,
+                                         uint32_t *multi_index,
+                                         uint32_t *child_num) {
+  if (!keypath || !cursor || !multi_index || !child_num)
     return NULL;
-  if (keypath_len < 4)
-    return NULL;
-  size_t payload = keypath_len - 4;
-  if (payload % 4 != 0)
-    return NULL;
-  size_t total_depth = payload / 4;
-  if (total_depth > MAX_KEYPATH_TOTAL_DEPTH)
+  uint32_t path[MAX_KEYPATH_TOTAL_DEPTH];
+  size_t depth = 0;
+  if (!bip32_path_from_keypath(keypath, keypath_len, path, &depth,
+                               MAX_KEYPATH_TOTAL_DEPTH))
     return NULL;
 
-  for (size_t i = *cursor; i < registry_len; i++) {
-    registry_entry_t *e = &registry_entries[i];
-    if (e->origin_path_len > total_depth)
-      continue;
-    bool origin_matches = true;
-    for (size_t j = 0; j < e->origin_path_len; j++) {
-      if (bip32_path_u32_le(keypath + 4 + j * 4) != e->origin_path[j]) {
-        origin_matches = false;
-        break;
+  for (; cursor->entry < registry_len;
+       cursor->entry++, cursor->multi_index = 0) {
+    registry_entry_t *e = &registry_entries[cursor->entry];
+    uint32_t groups = e->num_paths > 1 ? (uint32_t)e->num_paths : 1;
+    for (; cursor->multi_index < groups; cursor->multi_index++) {
+      for (size_t k = 0; k < e->num_own_keys; k++) {
+        if (own_key_matches(&e->own_keys[k], cursor->multi_index, path, depth,
+                            child_num)) {
+          *multi_index = cursor->multi_index++;
+          return e;
+        }
       }
     }
-    if (!origin_matches)
-      continue;
-    size_t tail_depth = total_depth - e->origin_path_len;
-    if (tail_depth != MAX_KEYPATH_TAIL_DEPTH)
-      continue;
-    const uint8_t *tail = keypath + 4 + e->origin_path_len * 4;
-    uint32_t mp = bip32_path_u32_le(tail);
-    uint32_t ix = bip32_path_u32_le(tail + 4);
-    if (bip32_path_is_hardened(mp))
-      continue;
-    if (bip32_path_is_hardened(ix))
-      continue;
-    if (mp > 1)
-      continue;
-    if (e->num_paths == 1 && mp != 0)
-      continue;
-    *cursor = i + 1;
-    return e;
   }
   return NULL;
+}
+
+bool registry_own_key_path(const registry_own_key_t *key, uint32_t multi_index,
+                           uint32_t child_num, uint32_t *path_out,
+                           size_t *len_out) {
+  if (!key || !path_out || !len_out ||
+      key->origin_path_len > MAX_KEYPATH_TOTAL_DEPTH)
+    return false;
+  memcpy(path_out, key->origin_path, key->origin_path_len * sizeof(uint32_t));
+  size_t written = 0;
+  size_t len = strlen(key->child_path);
+  if (len &&
+      bip32_path_from_str_n(key->child_path, len, child_num, multi_index,
+                            BIP32_FLAG_STR_WILDCARD | BIP32_FLAG_STR_BARE |
+                                BIP32_FLAG_STR_MULTIPATH,
+                            path_out + key->origin_path_len,
+                            MAX_KEYPATH_TOTAL_DEPTH - key->origin_path_len,
+                            &written) != WALLY_OK)
+    return false;
+  if (written > MAX_KEYPATH_TOTAL_DEPTH - key->origin_path_len)
+    return false;
+  *len_out = key->origin_path_len + written;
+  return true;
+}
+
+/* Every key carrying `wallet_fp`, in key order. Keys past
+ * REGISTRY_MAX_OWN_KEYS, or whose path does not fit, cannot be matched to a
+ * PSBT keypath; that fails closed. */
+static void collect_own_keys(registry_entry_t *e,
+                             const unsigned char *wallet_fp,
+                             uint32_t num_keys) {
+  for (uint32_t i = 0; i < num_keys && e->num_own_keys < REGISTRY_MAX_OWN_KEYS;
+       i++) {
+    unsigned char kfp[BIP32_KEY_FINGERPRINT_LEN];
+    if (wally_descriptor_get_key_origin_fingerprint(e->desc, i, kfp,
+                                                    sizeof(kfp)) != WALLY_OK ||
+        memcmp(kfp, wallet_fp, sizeof(kfp)) != 0)
+      continue;
+
+    registry_own_key_t *k = &e->own_keys[e->num_own_keys];
+    char *origin = NULL;
+    char *child = NULL;
+    bool ok = wally_descriptor_get_key_origin_path_str(e->desc, i, &origin) ==
+                  WALLY_OK &&
+              origin &&
+              (origin[0] == '\0' ||
+               bip32_path_parse(origin, k->origin_path, &k->origin_path_len,
+                                MAX_KEYPATH_TOTAL_DEPTH)) &&
+              wally_descriptor_get_key_child_path_str(e->desc, i, &child) ==
+                  WALLY_OK &&
+              child && strlen(child) < sizeof(k->child_path);
+    if (ok) {
+      k->key_index = i;
+      strcpy(k->child_path, child);
+      e->num_own_keys++;
+    } else {
+      ESP_LOGW(TAG, "own key %u of '%s' cannot be matched", (unsigned)i, e->id);
+      memset(k, 0, sizeof(*k));
+    }
+    wally_free_string(origin);
+    wally_free_string(child);
+  }
+}
+
+bool registry_add_parsed(const char *id, struct wally_descriptor *desc,
+                         size_t key_index, storage_location_t loc,
+                         bool persist) {
+  if (!id || !desc)
+    goto fail;
+  if (registry_len >= REGISTRY_MAX_ENTRIES) {
+    ESP_LOGE(TAG, "registry full (%d entries)", REGISTRY_MAX_ENTRIES);
+    goto fail;
+  }
+
+  unsigned char wallet_fp[BIP32_KEY_FINGERPRINT_LEN];
+  uint32_t num_keys = 0;
+  if (!key_get_fingerprint(wallet_fp) ||
+      wally_descriptor_get_num_keys(desc, &num_keys) != WALLY_OK ||
+      key_index >= num_keys)
+    goto fail;
+
+  char *path_str = NULL;
+  uint32_t origin_path[MAX_KEYPATH_ORIGIN_DEPTH];
+  size_t origin_path_len = 0;
+  if (wally_descriptor_get_key_origin_path_str(desc, (uint32_t)key_index,
+                                               &path_str) != WALLY_OK ||
+      !path_str) {
+    ESP_LOGE(TAG, "failed to get origin path for key %zu", key_index);
+    goto fail;
+  }
+  bool path_ok = bip32_path_parse(path_str, origin_path, &origin_path_len,
+                                  MAX_KEYPATH_ORIGIN_DEPTH);
+  wally_free_string(path_str);
+  if (!path_ok) {
+    ESP_LOGE(TAG, "failed to parse origin path for key %zu", key_index);
+    goto fail;
+  }
+
+  uint32_t num_paths = 0;
+  if (wally_descriptor_get_num_paths(desc, &num_paths) != WALLY_OK)
+    goto fail;
+
+  registry_entry_t *e = &registry_entries[registry_len];
+  memset(e, 0, sizeof *e);
+  strncpy(e->id, id, REGISTRY_ID_MAX_LEN - 1);
+  e->loc = loc;
+  e->desc = desc;
+  e->my_key_index = key_index;
+  e->num_paths = (size_t)num_paths;
+  e->origin_path_len = origin_path_len;
+  memcpy(e->origin_path, origin_path, origin_path_len * sizeof(uint32_t));
+  e->wrapper = registry_descriptor_wrapper(desc);
+  collect_own_keys(e, wallet_fp, num_keys);
+  set_script_id(e);
+  registry_len++;
+
+  if (persist) {
+    if (!registry_persist(id, id)) {
+      ESP_LOGE(TAG, "persisting descriptor failed, rolling back");
+      wally_descriptor_free(desc);
+      memset(&registry_entries[registry_len - 1], 0, sizeof(registry_entry_t));
+      registry_len--;
+      return false;
+    }
+    e->persisted = true;
+  }
+
+  ESP_LOGI(TAG, "added '%s' (%zu entries total)", id, registry_len);
+  return true;
+
+fail:
+  wally_descriptor_free(desc);
+  return false;
 }
 
 bool registry_add_from_string(const char *id, const char *descriptor_str,
@@ -279,94 +523,70 @@ bool registry_add_from_string(const char *id, const char *descriptor_str,
 
   /* Wallet's network only. Wrong-network descriptors are skipped on
    * boot scan; the validator blocks them on the user load path. */
-  uint32_t wally_network = (wallet_get_network() == WALLET_NETWORK_MAINNET)
-                               ? WALLY_NETWORK_BITCOIN_MAINNET
-                               : WALLY_NETWORK_BITCOIN_TESTNET;
   struct wally_descriptor *desc = NULL;
-  int ret = wallet_descriptor_parse(descriptor_str, NULL, wally_network, &desc);
+  int ret = wallet_descriptor_parse(descriptor_str, NULL,
+                                    wallet_wally_network(), &desc);
   if (ret != WALLY_OK) {
     ESP_LOGE(TAG, "failed to parse descriptor: %d", ret);
     return false;
   }
 
   unsigned char wallet_fp[BIP32_KEY_FINGERPRINT_LEN];
-  if (!key_get_fingerprint(wallet_fp)) {
-    ESP_LOGE(TAG, "key_get_fingerprint failed");
-    wally_descriptor_free(desc);
-    return false;
-  }
   uint32_t num_keys = 0;
-  if (wally_descriptor_get_num_keys(desc, &num_keys) != WALLY_OK) {
+  if (!key_get_fingerprint(wallet_fp) ||
+      wally_descriptor_get_num_keys(desc, &num_keys) != WALLY_OK) {
     wally_descriptor_free(desc);
     return false;
   }
-  int key_index = -1;
   for (uint32_t i = 0; i < num_keys; i++) {
     unsigned char kfp[BIP32_KEY_FINGERPRINT_LEN];
     if (wally_descriptor_get_key_origin_fingerprint(
             desc, i, kfp, BIP32_KEY_FINGERPRINT_LEN) == WALLY_OK &&
-        memcmp(wallet_fp, kfp, BIP32_KEY_FINGERPRINT_LEN) == 0) {
-      key_index = (int)i;
-      break;
-    }
+        memcmp(wallet_fp, kfp, BIP32_KEY_FINGERPRINT_LEN) == 0)
+      return registry_add_parsed(id, desc, i, loc, persist);
   }
-  if (key_index < 0) {
-    ESP_LOGW(TAG, "wallet fingerprint not found in descriptor '%s'", id);
-    wally_descriptor_free(desc);
-    return false;
-  }
+  ESP_LOGW(TAG, "wallet fingerprint not found in descriptor '%s'", id);
+  wally_descriptor_free(desc);
+  return false;
+}
 
-  char *path_str = NULL;
-  uint32_t origin_path[MAX_KEYPATH_ORIGIN_DEPTH];
-  size_t origin_path_len = 0;
-  if (wally_descriptor_get_key_origin_path_str(desc, (uint32_t)key_index,
-                                               &path_str) != WALLY_OK ||
-      !path_str) {
-    ESP_LOGE(TAG, "failed to get origin path for key %d", key_index);
-    wally_descriptor_free(desc);
+bool registry_persist(const char *id, const char *name) {
+  const storage_location_t loc = STORAGE_FLASH;
+  if (!id || !name || name[0] == '\0')
     return false;
+  registry_entry_t *e = NULL;
+  for (size_t i = 0; i < registry_len; i++) {
+    if (strncmp(registry_entries[i].id, id, REGISTRY_ID_MAX_LEN) == 0)
+      e = &registry_entries[i];
   }
-  bool path_ok = bip32_path_parse(path_str, origin_path, &origin_path_len,
-                                  MAX_KEYPATH_ORIGIN_DEPTH);
-  wally_free_string(path_str);
-  if (!path_ok) {
-    ESP_LOGE(TAG, "failed to parse origin path for key %d", key_index);
-    wally_descriptor_free(desc);
+  if (!e || e->persisted || !e->desc)
     return false;
-  }
+  if (strncmp(id, name, REGISTRY_ID_MAX_LEN) != 0 && registry_find_by_id(name))
+    return false;
+  /* Another seed's backup may sit under this name without being loaded. */
+  if (storage_descriptor_exists(loc, name, STORAGE_DESCRIPTOR_BIP138))
+    return false;
 
-  uint32_t num_paths = 0;
-  if (wally_descriptor_get_num_paths(desc, &num_paths) != WALLY_OK) {
-    wally_descriptor_free(desc);
+  char *descriptor_str = NULL;
+  if (wally_descriptor_canonicalize(e->desc, 0, &descriptor_str) != WALLY_OK)
+    return false;
+  uint8_t *blob = NULL;
+  size_t blob_len = 0;
+  bool ok = bip138_backup_encrypt(descriptor_str, &blob, &blob_len) &&
+            storage_save_descriptor(loc, name, blob, blob_len,
+                                    STORAGE_DESCRIPTOR_BIP138) == ESP_OK;
+  free(blob);
+  wally_free_string(descriptor_str);
+  if (!ok) {
+    ESP_LOGE(TAG, "registering '%s' failed", name);
     return false;
   }
-
-  registry_entry_t *e = &registry_entries[registry_len];
-  memset(e, 0, sizeof *e);
-  strncpy(e->id, id, REGISTRY_ID_MAX_LEN - 1);
+  strncpy(e->id, name, REGISTRY_ID_MAX_LEN - 1);
+  e->id[REGISTRY_ID_MAX_LEN - 1] = '\0';
+  strncpy(e->label, name, REGISTRY_LABEL_MAX_LEN - 1);
+  e->label[REGISTRY_LABEL_MAX_LEN - 1] = '\0';
   e->loc = loc;
-  e->desc = desc;
-  e->my_key_index = (size_t)key_index;
-  e->num_paths = (size_t)num_paths;
-  e->origin_path_len = origin_path_len;
-  memcpy(e->origin_path, origin_path, origin_path_len * sizeof(uint32_t));
-  registry_len++;
-
-  if (persist) {
-    esp_err_t err =
-        storage_save_descriptor(loc, id, (const uint8_t *)descriptor_str,
-                                strlen(descriptor_str), false);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "storage_save_descriptor failed (%d), rolling back", err);
-      wally_descriptor_free(desc);
-      memset(&registry_entries[registry_len - 1], 0, sizeof(registry_entry_t));
-      registry_len--;
-      return false;
-    }
-    e->persisted = true;
-  }
-
-  ESP_LOGI(TAG, "added '%s' (%zu entries total)", id, registry_len);
+  e->persisted = true;
   return true;
 }
 
@@ -383,12 +603,10 @@ bool registry_add_watch_only(const char *id, const char *descriptor_str,
     return false;
   }
 
-  uint32_t wally_network = (network == WALLET_NETWORK_MAINNET)
-                               ? WALLY_NETWORK_BITCOIN_MAINNET
-                               : WALLY_NETWORK_BITCOIN_TESTNET;
   struct wally_descriptor *desc = NULL;
-  if (wallet_descriptor_parse(descriptor_str, NULL, wally_network, &desc) !=
-      WALLY_OK) {
+  if (wallet_descriptor_parse(descriptor_str, NULL,
+                              wallet_wally_network_of(network),
+                              &desc) != WALLY_OK) {
     ESP_LOGE(TAG, "failed to parse watch-only descriptor");
     return false;
   }
@@ -407,6 +625,8 @@ bool registry_add_watch_only(const char *id, const char *descriptor_str,
   e->my_key_index = SIZE_MAX; // no key in watch-only mode
   e->num_paths = (size_t)num_paths;
   e->origin_path_len = 0;
+  e->wrapper = registry_descriptor_wrapper(desc);
+  set_script_id(e);
   registry_len++;
 
   ESP_LOGI(TAG, "added watch-only '%s' (%zu entries total)", id, registry_len);

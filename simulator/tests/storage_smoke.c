@@ -1,8 +1,9 @@
-#include "core/storage.h"
 #include "core/kef.h"
+#include "core/storage.h"
 #include "sim_flash.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,7 @@
 #define CHECK(cond, msg)                                                       \
   do {                                                                         \
     if (!(cond)) {                                                             \
-      fprintf(stderr, "storage_smoke failed: %s\n", msg);                     \
+      fprintf(stderr, "storage_smoke failed: %s\n", msg);                      \
       return 1;                                                                \
     }                                                                          \
   } while (0)
@@ -33,34 +34,25 @@ static int mkdir_p(const char *path) {
   return mkdir(tmp, 0700);
 }
 
-static void remove_tree(const char *path) {
-  DIR *dir = opendir(path);
-  if (!dir) {
+static void remove_tree_at(int parent, const char *name) {
+  int fd =
+      openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    unlinkat(parent, name, 0);
     return;
   }
-
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
-
-    char child[512];
-    snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-
-    struct stat st;
-    if (lstat(child, &st) != 0)
-      continue;
-
-    if (S_ISDIR(st.st_mode)) {
-      remove_tree(child);
-      rmdir(child);
-    } else {
-      unlink(child);
-    }
+  DIR *dir = fdopendir(fd);
+  if (!dir) {
+    close(fd);
+    return;
   }
-
+  struct dirent *e;
+  while ((e = readdir(dir)) != NULL) {
+    if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+      remove_tree_at(dirfd(dir), e->d_name);
+  }
   closedir(dir);
-  rmdir(path);
+  unlinkat(parent, name, AT_REMOVEDIR);
 }
 
 static bool list_has(char **files, int count, const char *name) {
@@ -74,7 +66,8 @@ static bool list_has(char **files, int count, const char *name) {
 static int expect_loaded(const uint8_t *expected, size_t expected_len,
                          const uint8_t *actual, size_t actual_len,
                          const char *label) {
-  if (actual_len != expected_len || memcmp(actual, expected, expected_len) != 0) {
+  if (actual_len != expected_len ||
+      memcmp(actual, expected, expected_len) != 0) {
     fprintf(stderr, "storage_smoke failed: %s bytes differ\n", label);
     return 1;
   }
@@ -82,8 +75,8 @@ static int expect_loaded(const uint8_t *expected, size_t expected_len,
 }
 
 int main(void) {
-  char root[256];
-  snprintf(root, sizeof(root), "/tmp/kern-sim-storage-smoke-%ld", (long)getpid());
+  char root[] = "/tmp/kern-sim-storage-smoke-XXXXXX";
+  CHECK(mkdtemp(root) != NULL, "create temp root");
 
   char flash_root[320];
   char nvs_root[320];
@@ -92,7 +85,6 @@ int main(void) {
   snprintf(nvs_root, sizeof(nvs_root), "%s/nvs", root);
   snprintf(sentinel, sizeof(sentinel), "%s/settings.nvs", nvs_root);
 
-  remove_tree(root);
   mkdir_p(nvs_root);
   FILE *nf = fopen(sentinel, "wb");
   CHECK(nf != NULL, "create NVS sentinel");
@@ -106,8 +98,8 @@ int main(void) {
   size_t kef_blob_len = 0;
   const uint8_t password[] = "test";
   const uint8_t secret[] = "seed entropy bytes";
-  CHECK(kef_encrypt((const uint8_t *)"SmokeName", 9, KEF_V16_CTR_Z_H4,
-                    password, strlen((const char *)password), 10000, secret,
+  CHECK(kef_encrypt((const uint8_t *)"SmokeName", 9, KEF_V16_CTR_Z_H4, password,
+                    strlen((const char *)password), 10000, secret,
                     sizeof(secret) - 1, &kef_blob, &kef_blob_len) == KEF_OK,
         "create KEF envelope");
   CHECK(kef_is_envelope(kef_blob, kef_blob_len), "valid KEF envelope");
@@ -132,8 +124,8 @@ int main(void) {
   CHECK(storage_load_mnemonic(STORAGE_FLASH, "m_Smoke_Name.kef", &loaded,
                               &loaded_len) == ESP_OK,
         "load flash mnemonic");
-  CHECK(expect_loaded(kef_blob, kef_blob_len, loaded, loaded_len,
-                      "mnemonic") == 0,
+  CHECK(expect_loaded(kef_blob, kef_blob_len, loaded, loaded_len, "mnemonic") ==
+            0,
         "mnemonic round-trip");
 
   char *display_name = storage_get_kef_display_name(loaded, loaded_len);
@@ -154,16 +146,18 @@ int main(void) {
   free(loaded);
 
   CHECK(storage_save_descriptor(STORAGE_FLASH, "Desc Kef", kef_blob,
-                                kef_blob_len, true) == ESP_OK,
+                                kef_blob_len, STORAGE_DESCRIPTOR_KEF) == ESP_OK,
         "save encrypted descriptor");
-  CHECK(storage_descriptor_exists(STORAGE_FLASH, "Desc Kef", true),
+  CHECK(storage_descriptor_exists(STORAGE_FLASH, "Desc Kef",
+                                  STORAGE_DESCRIPTOR_KEF),
         "encrypted descriptor exists");
 
   CHECK(storage_save_descriptor(STORAGE_FLASH, "Plain Desc",
-                                (const uint8_t *)descriptor,
-                                strlen(descriptor), false) == ESP_OK,
+                                (const uint8_t *)descriptor, strlen(descriptor),
+                                STORAGE_DESCRIPTOR_TXT) == ESP_OK,
         "save plaintext descriptor");
-  CHECK(storage_descriptor_exists(STORAGE_FLASH, "Plain Desc", false),
+  CHECK(storage_descriptor_exists(STORAGE_FLASH, "Plain Desc",
+                                  STORAGE_DESCRIPTOR_TXT),
         "plaintext descriptor exists");
 
   CHECK(storage_list_descriptors(STORAGE_FLASH, &files, &count) == ESP_OK,
@@ -174,20 +168,20 @@ int main(void) {
         "plaintext descriptor filename");
   storage_free_file_list(files, count);
 
-  bool encrypted = false;
+  storage_descriptor_format_t format = STORAGE_DESCRIPTOR_TXT;
   CHECK(storage_load_descriptor(STORAGE_FLASH, "d_Desc_Kef.kef", &loaded,
-                                &loaded_len, &encrypted) == ESP_OK,
+                                &loaded_len, &format) == ESP_OK,
         "load encrypted descriptor");
-  CHECK(encrypted, "encrypted flag");
+  CHECK(format == STORAGE_DESCRIPTOR_KEF, "encrypted flag");
   CHECK(expect_loaded(kef_blob, kef_blob_len, loaded, loaded_len,
                       "encrypted descriptor") == 0,
         "encrypted descriptor round-trip");
   free(loaded);
 
   CHECK(storage_load_descriptor(STORAGE_FLASH, "d_Plain_Desc.txt", &loaded,
-                                &loaded_len, &encrypted) == ESP_OK,
+                                &loaded_len, &format) == ESP_OK,
         "load plaintext descriptor");
-  CHECK(!encrypted, "plaintext flag");
+  CHECK(format == STORAGE_DESCRIPTOR_TXT, "plaintext flag");
   CHECK(expect_loaded((const uint8_t *)descriptor, strlen(descriptor), loaded,
                       loaded_len, "plaintext descriptor") == 0,
         "plaintext descriptor round-trip");
@@ -208,7 +202,7 @@ int main(void) {
   CHECK(stat(sentinel, &st) == 0, "NVS sentinel preserved");
 
   free(kef_blob);
-  remove_tree(root);
+  remove_tree_at(AT_FDCWD, root);
   puts("storage_smoke ok");
   return 0;
 }

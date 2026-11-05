@@ -1,12 +1,108 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.21] - 2026-11-05
 
-### Fixed
-- Camera preview flicker in bright areas on CrowPanel (SC2336): esp_ipa 2.2.0 hunts around the AE target where 2.1.0 did not. The SC2336 tuning now widens the AGC dead band from roughly ±3.5 to ±10 luma around the target, slows the increase and decrease speeds, and recomputes exposure every third frame instead of every frame. A scanner is better served by steady exposure than by precise exposure, and the result is calmer than 0.0.18 was
+### Added
+- ESP32-P4 v3.x silicon support: every board has a `<board>_v3` build, the web flasher picks the build matching the chip revision (esptool-js 0.7.0, kept at 115200 baud), and SD updates reject images for another revision. PSRAM runs at 200 MHz on v3.x with the core bus timeout disabled
+- Board target for the Waveshare ESP32-P4-Pico (`p4_pico`) with Waveshare's 5-DSI-TOUCH-A (720x1280), sharing wave_5's HX8394 driver, now its own component; the display MCU at I2C 0x45 drives power and backlight. Untested on hardware
+- Self Test in the pre-login Settings: known-answer checks for hashing, AES, PBKDF2 (and whether the SHA accelerator passes), BIP39/32/85, signing and dice
+- Single-sig descriptors name their script type on the load screen and in the session label
+- Fuzz targets and ASan/UBSan host builds for the code around libwally (`just fuzz`, `just test-asan`), and known-answer tests pinned to independent implementations
 
 ### Changed
+- BIP39 seeds derive on the SHA accelerator: about 200 ms down to 26 ms per derivation on wave_43
+- Faster PSBT review and signing: one classification serves the gate and the review, outputs are read without copying the transaction (large batch PSBTs no longer freeze the UI), registry scripts are generated once per claim, and only keypaths naming our key are tried
+- Faster address list and check: single-sig derives from a public chain key, descriptors derive each key's branch once (a 100+100 check of a 2-of-3 on wave_43 drops from 6.4 s to 3.7 s)
+- PSBTs are parsed and cloned preferring PSRAM, sparing the internal RAM secrets rely on
+- The secp256k1 context's blinding is randomized at boot and refreshed before signing; signatures stay RFC6979/BIP340 deterministic
+- BIP138 backups save to SD as raw `.bip138`, as Liana writes them (`.bip138.txt` still reads); at login, registered backups open through their stored paths only
+- The OV5647 is windowed to the 800x800 the scanner crops
+- libwally hashes via PSA and drops the Elements struct fields. Updated libwally (wsh() scripts up to 3600 bytes, multi() up to 20 keys), cUR and k_quirc
+
+### Fixed
+- libwally was built with Elements on (`-DBUILD_ELEMENTS=0` enables it), so Liquid PSETs parsed and could be signed; removing it saves 47 KB
+- Only the first key with the wallet fingerprint was verified against the seed; every such key is now checked by key material at its parsed origin, raw keys and xpubs without a parent fingerprint included
+- PSBT signing: registry keypaths matched only `/<0;1>/*` after the first own key, so other multipath groups and single-path descriptors were refused; only one own key signed per input (Liana primary + recovery); a leaf key was skipped when the seed also held the taproot internal key
+- Taproot key-path signatures that fail to verify against the output key (stray or missing merkle root) are dropped instead of exported
+- Inputs whose witness_utxo contradicts the previous transaction are refused at signing, not only at review
+- Change shows only when it returns to the inputs' wallet; other owned outputs are listed as Self-Transfer. Registry change past index 200 needs Permissive signing, like single-sig
+- Every output shows a destination (address, unknown witness version or script hex); the fee is trusted when every signed input is taproot; an unsummable output total is refused
+- Keypaths of nine or more steps were classified from stale stack bytes
+- Out of memory while restoring denied inputs or trimming v0 PSBTs could keep a discarded signature or export one without ours
+- A Nunchuk taproot multisig's unhardened internal-key path made a testnet PSBT read as mainnet
+- Descriptor loading: a checksum was dropped unchecked when `/<0;1>/*` was added; bare multi(), sortedmulti() and pk() are refused; watch-only loads are refused while a key is loaded; unusable own-key origins report as unsupported, not malformed
+- Multisig setup files: each Derivation line and BlueWallet `# derivation:` comment applies to the keys below it, and testnet Vpub/Upub convert
+- Policy view: long policies were cut, thresh() children could drop keys, hash hex could be painted as key letters, and tr() trees of pk() leaves read as "Multisig (0 of N)". Each distinct key gets one letter (26 distinct keys, 64 expressions)
+- Registry: duplicates are found by the scripts a descriptor pays, not its text; backups failing verification at login now warn instead of vanishing; key replacement restores approved backups instead of leaving the registry empty
+- BIP138: a hint is stored for every origin of a recipient key, the key cache is wiped on wallet unload, and binary `.bip138` files open from Home > Load
+- The address checker matched Base58 case-insensitively, so a ground case variant could read as verified; it now compares scriptPubKeys. Single-path descriptors searched receive addresses twice
+- Message signing always showed a P2WPKH address; it now follows the path's purpose (44/49/84) and refuses others. Messages the review font cannot display are refused, for BIP322 too
+- Changing Network in Settings dropped a passphrase set on an earlier visit to the page
+- Secrets: seed material on the LVGL stack is wiped and lock scrubs its unused stack; libwally's mnemonic copies stay in secret memory; mnemonic, SeedQR and QR scratch buffers are wiped before freeing
+- Descriptor UR export kept showing the previous QR when cUR cannot encode the descriptor
+
+## [0.0.20] - 2026-09-23
+
+### Added
+- BIP138 descriptor backups. After a descriptor loads, it can be kept for the session or registered on flash or SD card under a name. Backups are encrypted to the descriptor's own public keys with a seed-derived approval mark, and only approved backups that pass keyed validation are restored. Built on a new pure-C bip138 submodule using PSA crypto
+- Animated QR exports stream their frames instead of caching up to 100, so exports are no longer capped at 100 parts. Non-UR sequences get playback controls (pause, step, jump) and a frame counter with a progress grid
+- A Nix dev shell for host tools (formatting, native tests, simulator)
+- Opt-in scan pipeline profiling: `just scan-prof <board>` logs camera, PPA and decoder timing once a second
+
+### Changed
+- Faster, more reliable QR scanning. The decoder reads its own YUV420 frame cropped to 800 px, no longer limited by the preview size; a frame stays queued for it during the PPA pass, and the preview rate halves while a sequence comes in. On wave_43 the share of captures read rose from 46% to 59%
+- Updated k_quirc: decoding is faster on the ESP32-P4, and dense codes under uneven light read far more reliably
+- Signed PSBT QR exports leave out previous transactions, which coordinators now attach to every input and made the signed QR as heavy as the unsigned one. v2 PSBTs are trimmed too. The SD card export stays whole
+- clang-format is pinned to major 21 on every host, and unused static functions now warn; functions the firmware never calls were removed
+
+### Fixed
+- PIN verification did not abort when the failure count could not be read or persisted, so a failed write left the power-cut free attempt open and a failed read restarted the count from zero
+- Secret buffers left behind: the manual-input mnemonic after handoff to the editor, the compact SeedQR entropy on the stack, and the per-word buffer in `mnemonic_to_seedqr`
+- A BBQr sequence too large to store was only rejected once enough parts had arrived to exceed the cap; its first frame now gives it away, and duplicate parts are skipped
+- Scan progress was not shown for sequences over 100 parts
+- A degenerate grid could hang the QR decoder for about two minutes
+- White dots in the centre of dark modules on the CrowPanel preview, from the SC2336's photographic sharpen stage; it and the Bayer denoise are dropped
+- Slider tracks were invisible on panels, only the knob showed
+- The replace-key prompt stacks the two fingerprints, so the line never wraps mid-fingerprint
+- The address checker opened on the last used source instead of the descriptor the addresses page was showing
+- Scrollbars were drawn over their container's content instead of in its right gutter
+
+## [0.0.19] - 2026-09-17
+
+### Added
+- A scan-QR key on the keyboard loads text straight into the BIP39 passphrase and KEF key fields, so a long secret can come from a QR instead of being typed. It is opt-in per input: PIN and descriptor-name entry keep the plain keyboard. Non-text content is rejected by a strict UTF-8 validator, and non-ASCII text warns before use
+- Low battery warning on wave_43, wave_5 and wave_7b. These boards have no PMIC, only the pack voltage on GPIO20 through a 200k/100k divider, so the reading is reported as millivolts and percentage and charge status stay unsupported. Voltage alone cannot give a charge level. The header icon stays hidden above 3.5 V, shows in red below it, and clears again at 3.6 V. wave_7b is schematic-verified but untested on hardware
+- Miniscript account controls on the public key page: a -/+ stepper for the account, offered only while the path is the selected network and script's standard four-node, fully hardened one; custom paths remain editable via Path, and a standard Miniscript account survives a script change. The export layout is responsive: the QR takes whatever space the path and a Show XPUB button leave, and landscape places those details beside the QR instead of spending scarce vertical space on them
+- Icons on the Back Up menu entries, mirroring their Load Mnemonic counterparts, so the same destination is no longer drawn differently depending on which way the data moves
+
+### Changed
+- Secrets in RAM now follow written rules (`docs/security-plan.md`, section 0c). Allocations are wiped in full before release or relocation, with cleared PSRAM ranges written back to memory; the mnemonic, keys and libwally's private-key and mnemonic temporaries live in internal RAM only, through thread-local libwally allocator adapters, and an allocation failure is reported rather than falling back to PSRAM or to an empty passphrase. Large working buffers keep their existing policies
+- Stack-smashing protection is enabled, at a cost of 64 KB of flash, and `-Wvla` is an error for project sources
+- The entropy pool mixes in the eFuse MAC and the app description. It previously started from values identical on every device: its own address, the reset reason, the boot timestamp. Both additions are public, so they separate devices and builds rather than adding entropy
+- The unproven-fee note is skipped for single-input PSBTs. A signature commits to its own input's amount, so a lie about a lone input only produces an invalid signature; the fee attack needs two inputs signed in two rounds. Invalid or missing amounts stay flagged whatever the count
 - Updated to ESP-IDF 6.1 and newer managed components (esp_video 2.3.0, esp_lvgl_adapter 0.6.4, esp_cam_sensor 2.3.0). esp_video is held at 2.3.x deliberately: 2.4+ requires esp_ipa 2.3, whose prebuilt ESP32-P4 blob is built with the RISC-V B extension this core lacks, which crashes any board running the ISP pipeline controller. No source changes were needed: of 6.1's breaking changes, the deprecated MIPI DSI `on_refresh_done` callback is handled inside the LVGL adapter, the UART wakeup API is unused here, and the ESP32-P4 default-revision move to v3.0 was already covered by the existing `CONFIG_ESP32P4_SELECTS_REV_LESS_V3` setting that keeps v1.x boards supported
+- Boards that do not run the ISP pipeline controller link only the camera detection the app references, which drops libesp_ipa from the image entirely (about 30 KB). crowpanel runs the controller for the SC2336 and stays on dynamic link
+- Host tests now cover fw_update, descriptor_validator, storage, key, crypto_utils and pbkdf2, and the QR decoder regression tests run as part of `just test`
+- The scan page is split by flow: the 2300-line `scan.c` becomes one `scan_*.c` per flow around a shared context, and the PSBT review renderer collects its data up front and renders it through per-section helpers. Function bodies are moved, not rewritten; widget order, texts and colours are unchanged
+- Updated libwally-core and k_quirc, whose decoder now reuses its image capacity across resizes
+
+### Fixed
+- libwally's secret wiping could be optimised away: `config.h` left every wipe backend undefined, so `wally_bzero()` fell through to a bare `memset()` the compiler may elide, including the one `bip32_key_free()` uses to clear a private key
+- Locking and shutting down left sensitive state behind. Registered page owners are now destroyed, pending callbacks cancelled, and the crypto and QR workers joined before their buffers are released; password widgets, retained camera frames and the display banks are cleared before the lock screen renders and before power-off is attempted
+- Mnemonic buffers in the dice-roll, camera-entropy and QR-encoding paths were freed without being wiped first
+- The entropy pool was seeded with `esp_fill_random()`, which only replays the bootloader's seeding unless the SAR ADC source is on. It is now seeded from the physical noise source, a word at a time so each draw gets a refill window
+- A valid PSBT followed by trailing bytes parsed, and the remainder was silently dropped, because all three entry points passed `flags=0`. Parsing must now consume the whole payload; whitespace is trimmed first, since a PSBT ends on its 0x00 separator and a newline on an SD card file is padding, not payload
+- A complete PSBT with two inputs on one address was reported as partially signed: `wally_psbt_sign()` signs every input naming the key it is handed, so the first call signed both and the per-call count found nothing new on the second. Signed inputs are now counted against the finished PSBT
+- On the 32-bit target a hostile firmware segment length made the image offset wrap past the file size, so the layout walk accepted an inconsistent image and left rejection to the signature check alone
+- A descriptor whose key origin is only a fingerprint failed to verify: libwally rejects a zero-length derivation, so `key_get_xpub("m")` failed. A key without any origin showed its derivation as "m/" in the info dialog, which looked like a master key; it now reads N/A
+- `descriptor_validate_and_load()` never completed and leaked its context when called without an info callback, because the auto-confirm path skipped arming the generation its own liveness check reads. Both in-tree callers pass one, so this was latent
+- The BIP32 keypath buffer was a variable-length array sized by the caller; it is now a fixed array with the depth capped
+- A wrapped key-info header inherited the LVGL card style's DPI-scaled row gap, which clipped its second line on wave_35 where the nav bar is one corner button tall
+- Wallet settings rows sat against their top edge with all the slack pooled under the last row; they are now vertically centred and share the leftover space
+- The passphrase confirm prompt stacks the two fingerprints, so the line never wraps mid-fingerprint
+- Camera preview flicker in bright areas on CrowPanel (SC2336): esp_ipa 2.2.0 hunts around the AE target where 2.1.0 did not. The SC2336 tuning now widens the AGC dead band from roughly ±3.5 to ±10 luma around the target, slows the increase and decrease speeds, and recomputes exposure every third frame instead of every frame. A scanner is better served by steady exposure than by precise exposure, and the result is calmer than 0.0.18 was
+- The firmware zip shipped `flash_args` verbatim from the build tree while staging `bootloader.bin` and `partition-table.bin` at its root, so the documented esptool command failed on the `bootloader/` and `partition_table/` subdirectories
+- `just build` exited 0 after a compile error, because the recipe ended with a copy of `compile_commands.json` that cmake writes at configure time. CI was unaffected
 
 ## [0.0.18] - 2026-08-28
 

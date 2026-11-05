@@ -13,6 +13,13 @@
 bool descriptor_loader_show_error(descriptor_validation_result_t result);
 
 /**
+ * After a key load, tell the user if registered descriptors failed
+ * verification and were skipped (registry_rejected_count). Shows nothing
+ * otherwise; call it once the post-load page is on screen.
+ */
+void descriptor_loader_show_rejected_notice(void);
+
+/**
  * Extract descriptor from QR scanner, normalize, and validate.
  * Cleans up scanner pages (hide + destroy). Calls validation_cb with result.
  * If extraction fails, shows an error dialog and optionally calls error_cb.
@@ -44,6 +51,13 @@ void descriptor_loader_process_string_watch_only(
     void *user_data);
 
 /**
+ * After a successful keyed load, offer to keep the descriptor for this session
+ * only or to register it as a BIP138 backup on flash or SD card (which asks
+ * for a name). done_cb runs once the user is through, whatever they chose.
+ */
+void descriptor_loader_show_loaded_menu(void (*done_cb)(void));
+
+/**
  * Show a source selection menu for loading descriptors.
  * Presents QR / Flash / SD Card options.
  *
@@ -71,11 +85,6 @@ void descriptor_loader_destroy_source_menu(void);
  * @return Descriptor string (caller must free), or NULL on failure
  */
 char *descriptor_extract_from_scanner(void);
-
-// Normalize a descriptor by appending derivation path suffixes to keys
-// without them. Strips any existing checksum.
-// Returns new normalized string (caller must free), or NULL if unchanged.
-char *descriptor_to_unambiguous(const char *descriptor);
 
 /**
  * Render a miniscript policy (keys already replaced by letter IDs) as an

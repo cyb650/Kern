@@ -14,7 +14,9 @@
 #include "../../ui/input_helpers.h"
 #include "../../ui/theme_widgets.h"
 #include "../../utils/secure_mem.h"
+#include "../../utils/session_cleanup.h"
 #include "../../utils/worker_task.h"
+#include "secure_memory.h"
 #include "text_input_scan.h"
 #include <stdlib.h>
 #include <string.h>
@@ -75,6 +77,7 @@ static void poll_timer_cb(lv_timer_t *timer) {
   (void)timer;
   if (!decrypt_done)
     return;
+  worker_task_wait();
 
   /* Task finished — stop polling */
   lv_timer_del(poll_timer);
@@ -89,7 +92,7 @@ static void poll_timer_cb(lv_timer_t *timer) {
   /* Show error and let user retry */
   show_input();
   if (text_input.textarea)
-    lv_textarea_set_text(text_input.textarea, "");
+    ui_secure_clear_textarea(text_input.textarea);
 
   if (decrypt_result == KEF_ERR_AUTH) {
     dialog_show_error_timeout("Wrong key", NULL, 0);
@@ -106,12 +109,14 @@ static void keyboard_ready_cb(lv_event_t *e) {
 
   /* Copy key before clearing textarea */
   key_copy_len = strlen(text);
-  key_copy = malloc(key_copy_len);
-  if (!key_copy)
+  key_copy = kern_secret_alloc(key_copy_len);
+  if (!key_copy) {
+    dialog_show_error_timeout("Not enough internal RAM", NULL, 0);
     return;
+  }
   memcpy(key_copy, text, key_copy_len);
 
-  lv_textarea_set_text(text_input.textarea, "");
+  ui_secure_clear_textarea(text_input.textarea);
   show_loading();
 
   /* Launch decryption on CPU 1 to keep LVGL (CPU 0) responsive */
@@ -146,6 +151,7 @@ static void back_btn_cb(lv_event_t *e) {
 void kef_decrypt_page_create(lv_obj_t *parent, void (*return_cb)(void),
                              kef_decrypt_success_cb_t success_cb,
                              const uint8_t *envelope, size_t envelope_len) {
+  session_cleanup_register(kef_decrypt_page_destroy);
   (void)parent;
   return_callback = return_cb;
   success_callback = success_cb;
@@ -207,6 +213,8 @@ void kef_decrypt_page_hide(void) {
 }
 
 void kef_decrypt_page_destroy(void) {
+  worker_task_wait();
+  session_cleanup_unregister(kef_decrypt_page_destroy);
   if (poll_timer) {
     lv_timer_del(poll_timer);
     poll_timer = NULL;

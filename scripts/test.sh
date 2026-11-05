@@ -7,6 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/.." && pwd))"
 
+echo "Running secure memory and session cleanup tests..."
+make -C "$REPO_ROOT/components/secure_memory/test" run
+
 echo "Running deflate_codec tests..."
 make -C "$REPO_ROOT/components/deflate_codec/test" run
 
@@ -15,6 +18,9 @@ make -C "$REPO_ROOT/components/bbqr/test" run
 
 echo "Running QR parser tests..."
 make -C "$REPO_ROOT/main/qr/test" run
+
+echo "Running bip138 tests..."
+make -C "$REPO_ROOT/components/bip138" run
 
 echo "Running core tests..."
 make -C "$REPO_ROOT/main/core/test" run

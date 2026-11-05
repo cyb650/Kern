@@ -5,7 +5,10 @@
 #include "../../ui/input_helpers.h"
 #include "../../ui/theme_widgets.h"
 #include "../../ui/word_selector.h"
+#include "../../utils/session_cleanup.h"
 #include "../capture_entropy.h"
+#include "kern_wally.h"
+#include "secure_memory.h"
 #include <lvgl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +115,8 @@ static void show_hash_display(void) {
 
   lv_obj_t *hash_label = lv_label_create(hash_container);
   lv_label_set_text(hash_label, display_text);
+  secure_memzero(hex_hash, sizeof(hex_hash));
+  secure_memzero(display_text, sizeof(display_text));
   lv_obj_set_width(hash_label, LV_PCT(100));
   lv_label_set_long_mode(hash_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(hash_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -142,22 +147,15 @@ static void proceed_cb(lv_event_t *e) {
       (total_words == 12) ? ENTROPY_12_WORDS : ENTROPY_24_WORDS;
 
   char *mnemonic = NULL;
-  if (bip39_mnemonic_from_bytes(NULL, entropy_hash, entropy_len, &mnemonic) !=
-          WALLY_OK ||
+  if (kern_bip39_mnemonic_from_bytes(NULL, entropy_hash, entropy_len,
+                                     &mnemonic) != WALLY_OK ||
       !mnemonic) {
     dialog_show_error_timeout("Failed to generate mnemonic", NULL, 0);
     return;
   }
 
-  if (bip39_mnemonic_validate(NULL, mnemonic) != WALLY_OK) {
-    wally_free_string(mnemonic);
-    dialog_show_error_timeout("Invalid mnemonic generated", NULL, 0);
-    return;
-  }
-
   SECURE_FREE_STRING(completed_mnemonic);
-  completed_mnemonic = strdup(mnemonic);
-  wally_free_string(mnemonic);
+  completed_mnemonic = mnemonic;
 
   secure_memzero(entropy_hash, sizeof(entropy_hash));
   hash_captured = false;
@@ -177,6 +175,7 @@ static void back_cb(void) {
 
 void entropy_from_camera_page_create(lv_obj_t *parent,
                                      void (*return_cb)(void)) {
+  session_cleanup_register(entropy_from_camera_page_destroy);
   if (!parent)
     return;
 
@@ -204,6 +203,7 @@ void entropy_from_camera_page_hide(void) {
 }
 
 void entropy_from_camera_page_destroy(void) {
+  session_cleanup_unregister(entropy_from_camera_page_destroy);
   cleanup_ui();
 
   if (entropy_screen) {

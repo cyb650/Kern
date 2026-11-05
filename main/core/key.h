@@ -7,12 +7,17 @@
 #include <stdint.h>
 #include <wally_bip32.h>
 
-KERN_WARN_UNUSED_RESULT bool key_init(void);
+#define KEY_MAX_DERIVATION_DEPTH 10
+
 KERN_WARN_UNUSED_RESULT bool key_is_loaded(void);
+/* Owned mnemonic/private-key allocations require internal RAM on firmware.
+ * False includes internal-memory exhaustion; no PSRAM fallback is attempted. */
 KERN_WARN_UNUSED_RESULT bool key_load_from_mnemonic(const char *mnemonic,
                                                     const char *passphrase,
                                                     bool is_testnet);
 void key_unload(void);
+/* Switch the loaded key between mainnet and testnet. */
+KERN_WARN_UNUSED_RESULT bool key_set_network(bool is_testnet);
 
 /* Caller-provided buffer of BIP32_KEY_FINGERPRINT_LEN (4) bytes. */
 KERN_WARN_UNUSED_RESULT bool
@@ -49,7 +54,20 @@ KERN_WARN_UNUSED_RESULT bool key_get_derived_key(const char *path,
 KERN_WARN_UNUSED_RESULT bool
 key_get_derived_key_components(const uint32_t *path, size_t path_depth,
                                struct ext_key **key_out);
+/* The key at `path` with its private part removed, for deriving unhardened
+ * children publicly. Free with bip32_key_free(). */
+KERN_WARN_UNUSED_RESULT bool
+key_get_public_key_components(const uint32_t *path, size_t path_depth,
+                              struct ext_key **key_out);
 
-void key_cleanup(void);
+/* BIP-85 BIP39 child mnemonic of `master` (12, 18 or 24 words, English).
+ * SENSITIVE: free *mnemonic_out with wally_free_string(). */
+KERN_WARN_UNUSED_RESULT bool key_bip85_mnemonic(const struct ext_key *master,
+                                                uint32_t num_words,
+                                                uint32_t index,
+                                                char **mnemonic_out);
+/* Same, for the loaded key. */
+KERN_WARN_UNUSED_RESULT bool
+key_get_bip85_mnemonic(uint32_t num_words, uint32_t index, char **mnemonic_out);
 
 #endif // KEY_H

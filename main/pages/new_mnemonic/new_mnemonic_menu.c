@@ -6,6 +6,7 @@
 #include "../../ui/menu.h"
 #include "../../ui/theme_widgets.h"
 #include "../../utils/secure_mem.h"
+#include "../../utils/session_cleanup.h"
 #include "../home/home.h"
 #include "../load_mnemonic/manual_input.h"
 #include "../shared/key_confirmation.h"
@@ -28,7 +29,6 @@ static void return_from_dice_rolls_cb(void);
 static void return_from_entropy_from_camera_cb(void);
 static void return_from_manual_input_cb(void);
 static void return_from_mnemonic_editor_cb(void);
-static void return_from_key_confirmation_cb(void);
 static void success_from_key_confirmation_cb(void);
 
 static void return_from_dice_rolls_cb(void) {
@@ -68,11 +68,6 @@ static void return_from_manual_input_cb(void) {
 
 static void return_from_mnemonic_editor_cb(void) {
   mnemonic_editor_page_destroy();
-  new_mnemonic_menu_page_show();
-}
-
-static void return_from_key_confirmation_cb(void) {
-  key_confirmation_page_destroy();
   new_mnemonic_menu_page_show();
 }
 
@@ -131,6 +126,7 @@ static void back_cb(void) {
 }
 
 void new_mnemonic_menu_page_create(lv_obj_t *parent, void (*return_cb)(void)) {
+  session_cleanup_register(new_mnemonic_menu_page_destroy);
   if (!parent)
     return;
 
@@ -163,6 +159,7 @@ void new_mnemonic_menu_page_hide(void) {
 }
 
 void new_mnemonic_menu_page_destroy(void) {
+  session_cleanup_unregister(new_mnemonic_menu_page_destroy);
   if (new_mnemonic_menu) {
     ui_menu_destroy(new_mnemonic_menu);
     new_mnemonic_menu = NULL;

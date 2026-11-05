@@ -23,16 +23,20 @@ menu "Kern Configuration"
 
         config KERN_BOARD_WAVE_7B
             bool "Waveshare ESP32-P4-WiFi6-Touch-LCD-7B (1024x600 MIPI DSI)"
+
+        config KERN_BOARD_P4_PICO
+            bool "Waveshare ESP32-P4-Pico + 5-DSI-TOUCH-A (720x1280 MIPI DSI)"
     endchoice
 
     config KERN_PBKDF2_HW_SHA
-        bool "Drive PBKDF2-HMAC-SHA256 on the P4 SHA accelerator"
+        bool "Drive PBKDF2-HMAC-SHA256 and -SHA512 on the P4 SHA accelerator"
         default y
         help
             Holds the SHA peripheral across batches of PBKDF2 iterations and
             precomputes the HMAC ipad/opad midstates, so an iteration costs two
             hardware block compressions instead of four compressions wrapped in
-            four crypto-lock acquire/reset/release cycles.
+            four crypto-lock acquire/reset/release cycles. SHA-256 derives PIN
+            and KEF keys, SHA-512 BIP39 seeds.
 
             Output is byte-identical to the PSA path, which stays compiled in.
             Every call first runs a known-answer vector through the accelerated
@@ -65,5 +69,36 @@ menu "Kern Configuration"
             The host test suite cannot reach this code, so this is the only
             place the accelerated path is proven. Development only; it adds
             several seconds to boot.
+
+    config KERN_SCAN_PROFILING
+        bool "Log QR scanner pipeline timing once a second"
+        default n
+        help
+            While the scanner is open, prints one line a second prefixed PROF.
+            Times are average/maximum in microseconds.
+
+            cam: camera callbacks per second. gaps: callbacks by the time since
+            the previous one, in buckets <28/<39/<55/<78/>=78 ms; one frame
+            period of a 45 fps sensor lands in the first and a dropped frame in
+            the third. ppa: sensor frame to decode frame. prev: decode frame to
+            preview. nobuf: frames skipped for want of a free buffer. ui:
+            preview frames per second.
+
+            dec: decoder passes per second. wait: decoder idle before each
+            pass. gray, find, read: grayscale conversion, code location, code
+            decoding.
+
+            ok: passes that decoded. new: decodes whose payload differs from
+            the previous one. skip: sequential BBQr or pMofN parts the
+            animation showed and no pass decoded. none: passes that found no
+            code. bad: passes that found a code they could not read.
+
+            err: failed reads by cause: grid size, version, format ECC, data
+            ECC, other. qr: version and side in pixels of the last code read;
+            a version v code has 17 + 4v modules a side.
+
+            Development only. The line is printed from an idle-priority task so
+            its UART time stays off the tasks being measured. Use
+            just scan-prof <board>.
 
 endmenu

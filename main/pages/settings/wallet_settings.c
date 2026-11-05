@@ -4,14 +4,18 @@
 #include "wallet_settings.h"
 #include "../../core/key.h"
 #include "../../core/registry.h"
+#include "../../core/secp_hardening.h"
 #include "../../core/wallet.h"
 #include "../../ui/dialog.h"
 #include "../../ui/input_helpers.h"
 #include "../../ui/key_info.h"
 #include "../../ui/settings_row.h"
 #include "../../ui/theme_widgets.h"
+#include "../../utils/session_cleanup.h"
 #include "../passphrase.h"
+#include "../shared/descriptor_loader.h"
 #include "descriptor_manager.h"
+#include "secure_memory.h"
 #include <lvgl.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,8 +51,6 @@ static lv_obj_t *network_dropdown = NULL;
 static lv_obj_t *title_cont = NULL;
 
 static void (*return_callback)(void) = NULL;
-static char *stored_passphrase = NULL;
-static char *mnemonic_content = NULL;
 static wallet_network_t selected_network = WALLET_NETWORK_DEFAULT;
 
 static bool g_settings_applied = false;
@@ -65,27 +67,46 @@ static void back_btn_cb(lv_event_t *e) {
     return_callback();
 }
 
-/* Re-derive the live key+wallet from the current mnemonic, passphrase
- * and selected network. With the Apply button gone, network and
- * passphrase edits must take effect at the moment they're made. */
-static bool apply_wallet_changes(void) {
-  if (!mnemonic_content)
-    return false;
-  bool is_testnet = (selected_network == WALLET_NETWORK_TESTNET);
-  wallet_unload();
-  if (!key_load_from_mnemonic(mnemonic_content, stored_passphrase,
-                              is_testnet)) {
-    dialog_show_error_timeout("Failed to reload key", return_callback, 0);
-    return false;
-  }
+/* Rebuild the wallet on the live key for the selected network. With the
+ * Apply button gone, network and passphrase edits must take effect at
+ * the moment they're made. */
+static bool reinit_wallet(void) {
   if (!wallet_init(selected_network)) {
     dialog_show_error_timeout("Failed to initialize wallet", return_callback,
                               0);
     return false;
   }
-  registry_init(is_testnet);
+  secp_blind_refresh();
+  registry_init(selected_network == WALLET_NETWORK_TESTNET);
   g_settings_applied = true;
+  descriptor_loader_show_rejected_notice();
   return true;
+}
+
+/* A new passphrase changes the seed, so the key is re-derived from the
+ * mnemonic. NULL means no passphrase. The mnemonic is fetched here and
+ * freed before returning, so the page holds no secrets of its own. */
+static bool apply_passphrase(const char *passphrase) {
+  char *mnemonic = NULL;
+  if (!key_get_mnemonic(&mnemonic)) {
+    dialog_show_error_timeout("Failed to get mnemonic", return_callback, 0);
+    return false;
+  }
+  bool is_testnet = (selected_network == WALLET_NETWORK_TESTNET);
+  wallet_unload();
+  bool loaded = key_load_from_mnemonic(mnemonic, passphrase, is_testnet);
+  SECURE_FREE_STRING(mnemonic);
+  if (!loaded) {
+    dialog_show_error_timeout("Failed to reload key", return_callback, 0);
+    return false;
+  }
+  return reinit_wallet();
+}
+
+static bool apply_network(void) {
+  wallet_cleanup();
+  return key_set_network(selected_network == WALLET_NETWORK_TESTNET) &&
+         reinit_wallet();
 }
 
 static void network_dropdown_cb(lv_event_t *e) {
@@ -94,7 +115,7 @@ static void network_dropdown_cb(lv_event_t *e) {
       (sel == 0) ? WALLET_NETWORK_MAINNET : WALLET_NETWORK_TESTNET;
   if (new_network != selected_network) {
     selected_network = new_network;
-    if (apply_wallet_changes())
+    if (apply_network())
       settings_set_network(new_network);
   }
 }
@@ -129,16 +150,20 @@ static void passphrase_return_cb(void) {
 }
 
 static void passphrase_success_cb(const char *passphrase) {
-  SECURE_FREE_STRING(stored_passphrase);
-
+  char *copy = NULL;
   if (passphrase && passphrase[0] != '\0') {
-    stored_passphrase = strdup(passphrase);
+    copy = kern_secret_strdup(passphrase);
+    if (!copy) {
+      dialog_show_error_timeout("Not enough internal RAM", NULL, 0);
+      return;
+    }
   }
 
   passphrase_page_destroy();
   wallet_settings_page_show();
 
-  apply_wallet_changes();
+  apply_passphrase(copy);
+  SECURE_FREE_STRING(copy);
   refresh_fingerprint_display();
 }
 
@@ -186,17 +211,12 @@ static void distribute_item(lv_obj_t *item) {
 }
 
 void wallet_settings_page_create(lv_obj_t *parent, void (*return_cb)(void)) {
+  session_cleanup_register(wallet_settings_page_destroy);
   if (!parent || !key_is_loaded() || !wallet_is_initialized())
     return;
 
   return_callback = return_cb;
   selected_network = wallet_get_network();
-
-  // Get current mnemonic for later use
-  if (!key_get_mnemonic(&mnemonic_content)) {
-    dialog_show_error_timeout("Failed to get mnemonic", return_callback, 0);
-    return;
-  }
 
   // Main screen
   wallet_settings_screen = lv_obj_create(parent);
@@ -298,8 +318,7 @@ void wallet_settings_page_hide(void) {
 }
 
 void wallet_settings_page_destroy(void) {
-  SECURE_FREE_STRING(stored_passphrase);
-  SECURE_FREE_STRING(mnemonic_content);
+  session_cleanup_unregister(wallet_settings_page_destroy);
 
   if (wallet_settings_screen) {
     lv_obj_del(wallet_settings_screen);

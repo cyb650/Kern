@@ -1,16 +1,21 @@
-export IDF_PATH := env_var("HOME") + "/esp/esp-idf"
+export IDF_PATH := env_var_or_default("IDF_PATH", env_var("HOME") + "/esp/esp-idf")
 export IDF_PATH_FORCE := "1"
 
-# Board parameter: "wave_4b" (default), "wave_35", "wave_5", "wave_43", "crowpanel", or "wave_7b"
+# Board parameter: "wave_4b" (default), "wave_35", "wave_5", "wave_43", "crowpanel", "wave_7b", or "p4_pico"
 # Usage: just build wave_35, just flash wave_4b, just build wave_5, just build wave_7b
 # Each board builds into its own build_<board>/ directory, so switching
 # boards is instant (no clean required) and per-board builds stay incremental.
+# Append _v3 to a board (just build wave_43_v3) for ESP32-P4 chip revision
+# v3.x: IDF cannot build one image for both v1.x and v3.x silicon.
 
-boards := "wave_4b wave_35 wave_5 wave_43 crowpanel wave_7b"
+boards := "wave_4b wave_35 wave_5 wave_43 crowpanel wave_7b p4_pico"
 
 _check_board board:
     #!/usr/bin/env sh
-    case " {{boards}} " in *" {{board}} "*) ;; *) echo "error: unknown board '{{board}}' (valid: {{boards}})" >&2; exit 1;; esac
+    case " {{boards}} " in *" {{trim_end_match(board, "_v3")}} "*) ;; *) echo "error: unknown board '{{board}}' (valid: {{boards}}, each optionally suffixed _v3)" >&2; exit 1;; esac
+
+_defaults board:
+    @echo "sdkconfig.defaults;sdkconfig.defaults.{{trim_end_match(board, "_v3")}}{{ if board =~ '_v3$' { ";sdkconfig.rev3" } else { "" } }}"
 
 build board="wave_4b": (_check_board board)
     #!/usr/bin/env sh
@@ -19,13 +24,13 @@ build board="wave_4b": (_check_board board)
     # configure time, and just reports the recipe's last exit status.
     set -e
     command -v idf.py >/dev/null || . $IDF_PATH/export.sh
-    idf.py -B build_{{board}} -D SDKCONFIG=build_{{board}}/sdkconfig -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.{{board}}' build
+    idf.py -B build_{{board}} -D SDKCONFIG=build_{{board}}/sdkconfig -D "SDKCONFIG_DEFAULTS=$(just _defaults {{board}})" build
     cp ./build_{{board}}/compile_commands.json ./compile_commands.json
 
 flash board="wave_4b": (_check_board board)
     #!/usr/bin/env sh
     command -v idf.py >/dev/null || . $IDF_PATH/export.sh
-    idf.py -B build_{{board}} -D SDKCONFIG=build_{{board}}/sdkconfig -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.{{board}}' flash
+    idf.py -B build_{{board}} -D SDKCONFIG=build_{{board}}/sdkconfig -D "SDKCONFIG_DEFAULTS=$(just _defaults {{board}})" flash
 
 monitor board="wave_4b": (_check_board board)
     #!/usr/bin/env sh
@@ -36,7 +41,13 @@ monitor board="wave_4b": (_check_board board)
 pbkdf2-check board="wave_4b": (_check_board board)
     #!/usr/bin/env sh
     command -v idf.py >/dev/null || . $IDF_PATH/export.sh
-    idf.py -B build_pbkdf2_{{board}} -D SDKCONFIG=build_pbkdf2_{{board}}/sdkconfig -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.{{board}};sdkconfig.pbkdf2check' flash monitor
+    idf.py -B build_pbkdf2_{{board}} -D SDKCONFIG=build_pbkdf2_{{board}}/sdkconfig -D "SDKCONFIG_DEFAULTS=$(just _defaults {{board}});sdkconfig.pbkdf2check" flash monitor
+
+# Build with QR scanner pipeline timing, then watch it run
+scan-prof board="wave_4b": (_check_board board)
+    #!/usr/bin/env sh
+    command -v idf.py >/dev/null || . $IDF_PATH/export.sh
+    idf.py -B build_scanprof_{{board}} -D SDKCONFIG=build_scanprof_{{board}}/sdkconfig -D "SDKCONFIG_DEFAULTS=$(just _defaults {{board}});sdkconfig.scanprof" flash monitor
 
 format:
     ./scripts/format.sh
@@ -44,14 +55,30 @@ format:
 test:
     ./scripts/test.sh
 
+# Core host tests built with ASan and UBSan, libwally included
+test-asan:
+    make -C main/core/test clean
+    make -C main/core/test SANITIZE=1 run
+    make -C main/core/test clean
+
+# Fuzz the glue around libwally (ASan and UBSan, coverage-blind driver)
+fuzz iterations="20000":
+    make -C main/core/test clean
+    make -C main/core/test SANITIZE=1 FUZZ_ITERATIONS={{iterations}} fuzz
+    make -C main/core/test clean
+
 clean:
-    rm -fRd build build_wave_4b build_wave_35 build_wave_5 build_wave_43 build_crowpanel build_wave_7b
+    rm -fRd build build_wave_4b build_wave_35 build_wave_5 build_wave_43 build_crowpanel build_wave_7b build_p4_pico
+    rm -fRd build_*_v3
     rm -fRd build_pbkdf2_*
+    rm -fRd build_scanprof_*
     rm -f sdkconfig
     rm -fRd compile_commands.json
     rm -fRd .cache/
     rm -rf simulator/build
     make -C components/bbqr/test clean
+    make -C components/secure_memory/test clean
+    make -C components/bip138 clean
     make -C main/qr/test clean
     rm -rf components/k_quirc/test/build
     make -C main/core/test clean
@@ -68,7 +95,7 @@ site port="8000":
     set -e
     rm -rf site/branding site/flash/firmware
     cp -r branding site/branding
-    for b in {{boards}}; do
+    for b in {{boards}} $(printf '%s_v3 ' {{boards}}); do
         [ -f "build_$b/flasher_args.json" ] || continue
         stage="site/flash/firmware/$b"
         mkdir -p "$stage"
@@ -83,14 +110,14 @@ site port="8000":
     python3 -m http.server {{port}} -d site
 
 # Simulator board resolution mapping
-# wave_4b: 720x720, wave_35: 320x480, wave_5: 720x1280, wave_43: 480x800, crowpanel: 1024x600, wave_7b: 1024x600
+# wave_4b: 720x720, wave_35: 320x480, wave_5: 720x1280, wave_43: 480x800, crowpanel: 1024x600, wave_7b: 1024x600, p4_pico: 720x1280
 _sim_h_res board:
     #!/usr/bin/env sh
-    case "{{board}}" in wave_35) echo 320;; wave_5) echo 720;; wave_43) echo 480;; crowpanel) echo 1024;; wave_7b) echo 1024;; *) echo 720;; esac
+    case "{{board}}" in wave_35) echo 320;; wave_5) echo 720;; wave_43) echo 480;; crowpanel) echo 1024;; wave_7b) echo 1024;; p4_pico) echo 720;; *) echo 720;; esac
 
 _sim_v_res board:
     #!/usr/bin/env sh
-    case "{{board}}" in wave_35) echo 480;; wave_5) echo 1280;; wave_43) echo 800;; crowpanel) echo 600;; wave_7b) echo 600;; *) echo 720;; esac
+    case "{{board}}" in wave_35) echo 480;; wave_5) echo 1280;; wave_43) echo 800;; crowpanel) echo 600;; wave_7b) echo 600;; p4_pico) echo 1280;; *) echo 720;; esac
 
 # Build the desktop simulator
 sim-build board="wave_4b": (_check_board board)
@@ -99,6 +126,10 @@ sim-build board="wave_4b": (_check_board board)
         -DSIM_LCD_H_RES=$(just _sim_h_res {{board}}) \
         -DSIM_LCD_V_RES=$(just _sim_v_res {{board}}) \
         && cmake --build build -- -j$(nproc)
+
+# Run simulator storage and sensitive-data lifecycle regressions
+sim-test board="wave_4b": (sim-build board)
+    ctest --test-dir simulator/build --output-on-failure
 
 # Run the desktop simulator with webcam
 # SDL env vars: software renderer for compatibility with ssh -X

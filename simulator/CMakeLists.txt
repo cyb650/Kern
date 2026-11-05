@@ -43,21 +43,18 @@ if(NOT MBEDTLS_INCLUDE_DIR AND MBEDTLS_LIB)
   set(MBEDTLS_INCLUDE_DIR "${_mbedtls_prefix}/include")
 endif()
 
-set(MBEDTLS_COMPAT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../components/mbedtls_compat)
-set(MBEDTLS_INCLUDE_DIRS ${MBEDTLS_INCLUDE_DIR})
-if(EXISTS "${MBEDTLS_INCLUDE_DIR}/mbedtls/private/pkcs5.h"
-   AND NOT EXISTS "${MBEDTLS_INCLUDE_DIR}/mbedtls/pkcs5.h")
-  list(PREPEND MBEDTLS_INCLUDE_DIRS ${MBEDTLS_COMPAT_DIR})
-endif()
-
 # --- libwally-core (native desktop build) ---
 set(WALLY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../components/libwally-core)
 
 add_library(wally STATIC
+    ${WALLY_DIR}/kern_wally.c
+    ../components/secure_memory/secret_alloc.c
     ${WALLY_DIR}/upstream/src/amalgamation/combined.c
 )
 set_target_properties(wally PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(wally PUBLIC
+    ../components/secure_memory/include
+    ${WALLY_DIR}
     ${WALLY_DIR}/upstream/include
 )
 
@@ -66,43 +63,21 @@ target_include_directories(wally PRIVATE
     ${WALLY_DIR}/upstream
     ${WALLY_DIR}/upstream/src
     ${WALLY_DIR}/upstream/src/ccan
-    ${WALLY_DIR}/upstream/src/secp256k1
-    ${WALLY_DIR}/upstream/src/secp256k1/src
     ${WALLY_DIR}/upstream/src/secp256k1/include
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/ecdh
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/ecdsa_adaptor
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/ecdsa_s2c
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/extrakeys
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/generator
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/musig
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/rangeproof
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/recovery
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/schnorrsig
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/surjection
-    ${WALLY_DIR}/upstream/src/secp256k1/src/modules/whitelist
 )
 
 target_compile_definitions(wally PRIVATE
-    BUILD_ELEMENTS=0
     BUILD_MINIMAL=1
     # Standard libsecp256k1: drops MuSig2 + ecdsa-s2c/anti-exfil (unused by Kern).
     BUILD_STANDARD_SECP=1
     ECMULT_WINDOW_SIZE=8
-    ENABLE_MODULE_ECDH=1
-    ENABLE_MODULE_ECDSA_S2C=1
-    ENABLE_MODULE_EXTRAKEYS=1
-    ENABLE_MODULE_GENERATOR=1
-    ENABLE_MODULE_RANGEPROOF=1
-    ENABLE_MODULE_RECOVERY=1
-    ENABLE_MODULE_SCHNORRSIG=1
-    ENABLE_MODULE_SURJECTIONPROOF=1
-    ENABLE_MODULE_WHITELIST=1
-    HAVE_BUILTIN_POPCOUNT=1
-    NDEBUG=1
 )
 
+# Changes the public struct layouts, so every user of the headers needs it.
+target_compile_definitions(wally PUBLIC WALLY_ABI_NO_ELEMENTS)
+
 target_compile_options(wally PRIVATE
-    -w  # suppress all warnings (third-party code)
+    -Wall -Wextra -Wno-unused-parameter
     -fstack-protector-strong
 )
 
@@ -117,7 +92,7 @@ if(NOT EXISTS "${LVGL_DIR}/src/lvgl.h")
   FetchContent_Declare(
     lvgl_upstream
     GIT_REPOSITORY https://github.com/lvgl/lvgl.git
-    GIT_TAG        v9.3.0
+    GIT_TAG        v9.5.0
   )
   FetchContent_GetProperties(lvgl_upstream)
   if(NOT lvgl_upstream_POPULATED)
@@ -161,11 +136,15 @@ set(STUB_SOURCES
 
 # --- Application utilities ---
 set(APP_UTIL_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/ui/display_cleanup.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/session_cleanup.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../components/secure_memory/secure_memory.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/bip39_filter.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/dice_quality.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/estimated_entropy.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/session.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/utf8.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/text_file.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/utils/worker_task.c
 )
 
@@ -176,22 +155,36 @@ set(APP_CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf_stubs/storage_sim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/pin.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/crypto_utils.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf_stubs/pbkdf2_sim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/entropy_pool.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/kef.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/wallet.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/descriptor_parse.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/dice_mnemonic.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/base43.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/descriptor_validator.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/miniscript_policy.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/multisig_setup.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/key.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/message_sign.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/bip322.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/psbt.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/psbt_gate.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/psbt_parse.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/ss_whitelist.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/registry.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/bip138_crypto.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/bip138_keys.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/bip138_backup.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/descriptor_checksum.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/bip32_path.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/script_templates.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/address_match.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/descriptor_branch.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/descriptor_text.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/secp_hardening.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/crypto_init.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/self_test.c
     # Shared zlib adapter used by KEF and BBQr
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/deflate_codec/src/deflate_codec.c
     # bbqr (multi-part QR encoding)
@@ -207,6 +200,7 @@ set(APP_UI_SOURCES
     ${APP_UI_DIR}/keyboard.c
     ${APP_UI_DIR}/menu.c
     ${APP_UI_DIR}/numeric_keypad.c
+    ${APP_UI_DIR}/oneshot.c
     ${APP_UI_DIR}/path_keypad.c
     ${APP_UI_DIR}/power.c
     ${APP_UI_DIR}/word_selector.c
@@ -304,6 +298,7 @@ set(APP_PAGE_SOURCES
     ${APP_PAGES_DIR}/settings/wallet_settings.c
     ${APP_PAGES_DIR}/settings/registered_descriptors.c
     ${APP_PAGES_DIR}/settings/firmware_update.c
+    ${APP_PAGES_DIR}/settings/self_test_page.c
     # Shared pages
     ${APP_PAGES_DIR}/shared/address_checker.c
     ${APP_PAGES_DIR}/shared/descriptor_loader.c
@@ -339,13 +334,16 @@ set(APP_PAGE_SOURCES
 # --- QR + k_quirc + cUR ---
 set(QR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/qr/encoder.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/qr/seedqr.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/qr/parser.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/qr/viewer.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/qr/export.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/qr/scanner.c
 )
 
 file(GLOB KQUIRC_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../components/k_quirc/src/*.c)
 file(GLOB_RECURSE CUR_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../components/cUR/src/*.c)
+file(GLOB BIP138_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../components/bip138/src/*.c)
 
 add_library(lvgl STATIC
     ${LVGL_SOURCES}
@@ -380,6 +378,7 @@ add_executable(kern_simulator
     ${PLATFORM_SIM_SOURCES}
     ${KQUIRC_SOURCES}
     ${CUR_SOURCES}
+    ${BIP138_SOURCES}
 )
 
 # Include paths — order matters: simulator headers shadow ESP-IDF
@@ -391,12 +390,13 @@ target_include_directories(kern_simulator PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/sd_card_sim/include
     ${CMAKE_CURRENT_SOURCE_DIR}/platform               # sdkconfig.h
     ${CMAKE_CURRENT_SOURCE_DIR}                         # lv_conf.h
-    ${MBEDTLS_INCLUDE_DIRS}
+    ${MBEDTLS_INCLUDE_DIR}
     # Application source tree
     ${CMAKE_CURRENT_SOURCE_DIR}/../main                 # ui/theme.h, core/, utils/, pages/
     # Component headers (for kef.c -> deflate_codec, cUR, k_quirc, video)
     ${CMAKE_CURRENT_SOURCE_DIR}/../components
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/bbqr/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../components/bip138/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/deflate_codec/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/k_quirc/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/k_quirc/src
@@ -423,10 +423,12 @@ target_compile_definitions(kern_simulator PRIVATE
     $<$<STREQUAL:${SIM_BOARD},wave_43>:CONFIG_KERN_BOARD_WAVE_43=1>
     $<$<STREQUAL:${SIM_BOARD},crowpanel>:CONFIG_KERN_BOARD_CROWPANEL=1>
     $<$<STREQUAL:${SIM_BOARD},wave_7b>:CONFIG_KERN_BOARD_WAVE_7B=1>
+    $<$<STREQUAL:${SIM_BOARD},p4_pico>:CONFIG_KERN_BOARD_P4_PICO=1>
 )
 
 target_compile_options(kern_simulator PRIVATE
     -Wall -Wextra
+    -Werror=vla
     -Wno-unused-parameter
     -Wno-unused-function
     -Wno-sign-compare
@@ -476,6 +478,7 @@ add_executable(kern_sim_storage_smoke
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/kef.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/base43.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/crypto_utils.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf_stubs/pbkdf2_sim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/core/entropy_pool.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/deflate_codec/src/deflate_codec.c
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf_stubs/stubs.c
@@ -486,10 +489,11 @@ add_executable(kern_sim_storage_smoke
 
 target_include_directories(kern_sim_storage_smoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/esp_idf_stubs/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../components/bip138/include
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/sd_card_sim/include
     ${CMAKE_CURRENT_SOURCE_DIR}/platform
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${MBEDTLS_INCLUDE_DIRS}
+    ${MBEDTLS_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../main
     ${CMAKE_CURRENT_SOURCE_DIR}/../components
     ${CMAKE_CURRENT_SOURCE_DIR}/../components/deflate_codec/src
@@ -517,3 +521,51 @@ target_link_libraries(kern_sim_storage_smoke PRIVATE
 
 enable_testing()
 add_test(NAME storage_smoke COMMAND kern_sim_storage_smoke)
+
+target_include_directories(kern_simulator PRIVATE ../components/secure_memory/include)
+if(NOT APPLE)
+    target_link_options(kern_simulator PRIVATE -Wl,--wrap=free -Wl,--wrap=realloc)
+endif()
+
+# Reuse the real application/platform objects in lifecycle regression tests.
+get_target_property(cleanup_runtime_sources kern_simulator SOURCES)
+list(REMOVE_ITEM cleanup_runtime_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main_sim.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../components/secure_memory/secure_memory.c")
+add_library(kern_sim_runtime OBJECT ${cleanup_runtime_sources})
+foreach(prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(runtime_${prop} kern_simulator ${prop})
+    set_property(TARGET kern_sim_runtime PROPERTY ${prop} "${runtime_${prop}}")
+endforeach()
+set_property(TARGET kern_simulator PROPERTY SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main_sim.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../components/secure_memory/secure_memory.c"
+    $<TARGET_OBJECTS:kern_sim_runtime>)
+
+if(NOT APPLE)
+    add_executable(kern_sim_cleanup
+        tests/cleanup.c
+        ../components/secure_memory/secure_memory.c
+        $<TARGET_OBJECTS:kern_sim_runtime>)
+    foreach(prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS)
+        get_target_property(test_${prop} kern_simulator ${prop})
+        set_property(TARGET kern_sim_cleanup PROPERTY ${prop} "${test_${prop}}")
+    endforeach()
+    target_compile_definitions(kern_sim_cleanup PRIVATE SECURE_MEMORY_TEST_OBSERVER)
+    target_compile_options(kern_sim_cleanup PRIVATE -UNDEBUG)
+    target_link_options(kern_sim_cleanup PRIVATE -Wl,--wrap=strdup -Wl,--wrap=kern_secret_strdup)
+    add_test(NAME sensitive_cleanup COMMAND kern_sim_cleanup)
+    set_tests_properties(sensitive_cleanup PROPERTIES TIMEOUT 30)
+
+    add_executable(kern_sim_scan_registry
+        tests/scan_registry.c
+        ../components/secure_memory/secure_memory.c
+        $<TARGET_OBJECTS:kern_sim_runtime>)
+    foreach(prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS)
+        get_target_property(test_${prop} kern_simulator ${prop})
+        set_property(TARGET kern_sim_scan_registry PROPERTY ${prop} "${test_${prop}}")
+    endforeach()
+    target_compile_options(kern_sim_scan_registry PRIVATE -UNDEBUG)
+    add_test(NAME scan_registry COMMAND kern_sim_scan_registry)
+    set_tests_properties(scan_registry PROPERTIES TIMEOUT 30)
+endif()

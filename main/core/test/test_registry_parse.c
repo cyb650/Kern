@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <wally_core.h>
 
 #include "core/descriptor_checksum.h"
 #include "core/registry.h"
@@ -39,6 +40,12 @@ int registry_stub_storage_load_calls(void);
 #define DESC_WPKH "wpkh([00000000/84'/0'/0']" XPUB_84 "/<0;1>/*)#d9qwe873"
 
 int main(void) {
+  /* The host libwally hashes through PSA, as the device does, which needs
+   * wally_init. */
+  if (wally_init(0) != WALLY_OK) {
+    printf("ABORT: wally_init failed\n");
+    return 1;
+  }
   printf("=== registry_add_from_string parse tests ===\n\n");
 
   /* --- Group 1: wpkh multipath --- */
@@ -509,8 +516,8 @@ int main(void) {
     }
   }
 
-  /* --- Group 11: registry_init is RAM-only --- */
-  printf("\n--- Group 11: registry_init does not scan storage ---\n");
+  /* --- Group 11: registry_init scans storage for BIP138 backups --- */
+  printf("\n--- Group 11: registry_init scans descriptor storage ---\n");
   {
     registry_clear();
     registry_add_from_string("session", DESC_WPKH, STORAGE_FLASH, false);
@@ -525,12 +532,12 @@ int main(void) {
       FAIL("session entries were not cleared");
     }
 
-    TEST("registry_init: does not list descriptor storage");
-    if (registry_stub_storage_list_calls() == 0 &&
+    TEST("registry_init: lists flash descriptor storage");
+    if (registry_stub_storage_list_calls() == 1 &&
         registry_stub_storage_load_calls() == 0) {
       PASS();
     } else {
-      FAIL("storage was scanned");
+      FAIL("storage was not scanned");
     }
   }
 
@@ -581,6 +588,53 @@ int main(void) {
     } else {
       FAIL("h-style duplicate not found");
     }
+
+    /* Spellings of one wallet that the text checksum told apart. */
+    TEST("session duplicate: uppercase fingerprint");
+    if (registry_session_has_duplicate(
+            "wpkh([00000000/84'/0'/0']" XPUB_84 "/<0;1>/*)", NULL, 0) &&
+        registry_add_from_string(
+            "ms",
+            "wsh(sortedmulti(2,[00000000/48'/0'/0'/2']" XPUB_84
+            "/<0;1>/*,[AABBCCDD/48'/0'/0'/2']" XPUB_86 "/<0;1>/*))",
+            STORAGE_FLASH, false) &&
+        registry_session_has_duplicate(
+            "wsh(sortedmulti(2,[00000000/48'/0'/0'/2']" XPUB_84
+            "/<0;1>/*,[aabbccdd/48'/0'/0'/2']" XPUB_86 "/<0;1>/*))",
+            duplicate_id, sizeof(duplicate_id)) &&
+        strcmp(duplicate_id, "ms") == 0) {
+      PASS();
+    } else {
+      FAIL("uppercase fingerprint duplicate not found");
+    }
+
+    TEST("session duplicate: sortedmulti keys in another order");
+    if (registry_session_has_duplicate(
+            "wsh(sortedmulti(2,[aabbccdd/48'/0'/0'/2']" XPUB_86
+            "/<0;1>/*,[00000000/48'/0'/0'/2']" XPUB_84 "/<0;1>/*))",
+            duplicate_id, sizeof(duplicate_id)) &&
+        strcmp(duplicate_id, "ms") == 0) {
+      PASS();
+    } else {
+      FAIL("reordered sortedmulti duplicate not found");
+    }
+
+    TEST("session duplicate: key written without its origin");
+    if (registry_session_has_duplicate("wpkh(" XPUB_84 "/<0;1>/*)",
+                                       duplicate_id, sizeof(duplicate_id)) &&
+        strcmp(duplicate_id, "session") == 0) {
+      PASS();
+    } else {
+      FAIL("origin-less duplicate not found");
+    }
+
+    TEST("session duplicate: swapped receive and change is another wallet");
+    if (!registry_session_has_duplicate(
+            "wpkh([00000000/84'/0'/0']" XPUB_84 "/<1;0>/*)", NULL, 0)) {
+      PASS();
+    } else {
+      FAIL("<1;0> should not match <0;1>");
+    }
   }
 
   /* --- Group 13: removing a session descriptor does not delete storage --- */
@@ -591,7 +645,7 @@ int main(void) {
     registry_add_from_string("session", DESC_WPKH, STORAGE_FLASH, false);
 
     TEST("session remove: returns true");
-    if (registry_remove("session")) {
+    if (registry_remove_at(0)) {
       PASS();
     } else {
       FAIL("remove failed");

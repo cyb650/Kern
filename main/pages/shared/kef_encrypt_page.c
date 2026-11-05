@@ -15,7 +15,9 @@
 #include "../../ui/input_helpers.h"
 #include "../../ui/theme_widgets.h"
 #include "../../utils/secure_mem.h"
+#include "../../utils/session_cleanup.h"
 #include "../../utils/worker_task.h"
+#include "secure_memory.h"
 #include "text_input_scan.h"
 
 #include <stdio.h>
@@ -163,6 +165,7 @@ static void scan_key_cb(void *user_data) {
 /* ---------- Overlay management ---------- */
 
 static void destroy_overlay(void) {
+  worker_task_wait();
   if (encrypt_poll_timer) {
     lv_timer_del(encrypt_poll_timer);
     encrypt_poll_timer = NULL;
@@ -253,6 +256,7 @@ static void encrypt_poll_timer_cb(lv_timer_t *timer) {
   (void)timer;
   if (!encrypt_done)
     return;
+  worker_task_wait();
 
   lv_timer_del(encrypt_poll_timer);
   encrypt_poll_timer = NULL;
@@ -274,7 +278,7 @@ static void encrypt_poll_timer_cb(lv_timer_t *timer) {
     lv_label_set_text(overlay_title, "Encryption Key");
   ui_text_input_show(&text_input);
   if (text_input.textarea)
-    lv_textarea_set_text(text_input.textarea, "");
+    ui_secure_clear_textarea(text_input.textarea);
   if (strength_label)
     lv_obj_clear_flag(strength_label, LV_OBJ_FLAG_HIDDEN);
   dialog_show_error_timeout(kef_error_str(encrypt_result), NULL, 0);
@@ -292,12 +296,14 @@ static void password_ready_cb(lv_event_t *e) {
 
   if (!confirm_key) {
     /* First entry — save and ask for confirmation */
-    confirm_key = malloc(len);
-    if (!confirm_key)
+    confirm_key = kern_secret_alloc(len);
+    if (!confirm_key) {
+      dialog_show_error_timeout("Not enough internal RAM", NULL, 0);
       return;
+    }
     memcpy(confirm_key, text, len);
     confirm_key_len = len;
-    lv_textarea_set_text(text_input.textarea, "");
+    ui_secure_clear_textarea(text_input.textarea);
     if (overlay_title)
       lv_label_set_text(overlay_title, "Confirm Key");
     if (strength_label)
@@ -309,7 +315,7 @@ static void password_ready_cb(lv_event_t *e) {
   if (len != confirm_key_len || memcmp(text, confirm_key, len) != 0) {
     SECURE_FREE_BUFFER(confirm_key, confirm_key_len);
     confirm_key_len = 0;
-    lv_textarea_set_text(text_input.textarea, "");
+    ui_secure_clear_textarea(text_input.textarea);
     if (overlay_title)
       lv_label_set_text(overlay_title, "Encryption Key");
     if (strength_label)
@@ -324,7 +330,7 @@ static void password_ready_cb(lv_event_t *e) {
   confirm_key = NULL;
   confirm_key_len = 0;
 
-  lv_textarea_set_text(text_input.textarea, "");
+  ui_secure_clear_textarea(text_input.textarea);
 
   /* Show loading state */
   ui_text_input_hide(&text_input);
@@ -385,7 +391,8 @@ static void id_confirm_cb(bool confirmed, void *user_data) {
 void kef_encrypt_page_create(lv_obj_t *parent, void (*return_cb)(void),
                              kef_encrypt_success_cb_t success_cb,
                              const uint8_t *data, size_t data_len,
-                             const char *suggested_id) {
+                             const char *suggested_id, bool mnemonic_data) {
+  session_cleanup_register(kef_encrypt_page_destroy);
   (void)parent;
   if (!data || data_len == 0)
     return;
@@ -394,9 +401,13 @@ void kef_encrypt_page_create(lv_obj_t *parent, void (*return_cb)(void),
   success_callback = success_cb;
 
   /* Copy data to encrypt */
-  data_copy = malloc(data_len);
-  if (!data_copy)
+  data_copy = mnemonic_data ? kern_secret_alloc(data_len) : malloc(data_len);
+  if (!data_copy) {
+    dialog_show_error_timeout(mnemonic_data ? "Not enough internal RAM"
+                                            : "Not enough memory",
+                              return_cb, 0);
     return;
+  }
   memcpy(data_copy, data, data_len);
   data_copy_len = data_len;
 
@@ -437,6 +448,7 @@ void kef_encrypt_page_hide(void) {
 }
 
 void kef_encrypt_page_destroy(void) {
+  session_cleanup_unregister(kef_encrypt_page_destroy);
   destroy_overlay();
 
   SECURE_FREE_BUFFER(data_copy, data_copy_len);

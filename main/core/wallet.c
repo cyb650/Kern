@@ -1,7 +1,7 @@
 #include "wallet.h"
+#include "bip138_backup.h"
 #include "key.h"
 #include "registry.h"
-#include <wally_descriptor.h>
 
 static bool wallet_initialized = false;
 static bool wallet_watch_only = false;
@@ -29,6 +29,8 @@ void wallet_cleanup(void) {
 void wallet_unload(void) {
   key_unload();
   wallet_cleanup();
+  bip138_backup_forget_keys();
+  wallet_watch_only = false;
 }
 
 void wallet_set_watch_only(wallet_network_t network) {
@@ -41,11 +43,4 @@ bool wallet_is_watch_only(void) { return wallet_watch_only; }
 void wallet_clear_watch_only(void) {
   wallet_watch_only = false;
   registry_clear();
-}
-
-int wallet_descriptor_parse(const char *descriptor,
-                            const struct wally_map *vars_in, uint32_t network,
-                            struct wally_descriptor **output) {
-  uint32_t flags = KERN_DESCRIPTOR_MAX_DEPTH << WALLY_MINISCRIPT_DEPTH_SHIFT;
-  return wally_descriptor_parse(descriptor, vars_in, network, flags, output);
 }

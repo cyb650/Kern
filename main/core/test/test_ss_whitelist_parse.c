@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <wally_core.h>
 
 #include "core/ss_whitelist.h"
 
@@ -70,22 +71,13 @@ static void test_valid_purpose(const char *name, const unsigned char *buf,
   PASS();
 }
 
-static void test_format(const char *name, ss_keypath_t kp,
-                        const char *expected) {
-  TEST(name);
-  char buf[SS_KEYPATH_FMT_MAX];
-  if (!ss_keypath_format(&kp, buf, sizeof(buf))) {
-    FAIL("format returned false");
-    return;
-  }
-  if (strcmp(buf, expected) != 0) {
-    FAIL("wrong format string");
-    return;
-  }
-  PASS();
-}
-
 int main(void) {
+  /* The host libwally hashes through PSA, as the device does, which needs
+   * wally_init. */
+  if (wally_init(0) != WALLY_OK) {
+    printf("ABORT: wally_init failed\n");
+    return 1;
+  }
   printf("=== ss_keypath_parse tests ===\n\n");
 
   /* Group 1: round-trip all four valid purposes */
@@ -235,37 +227,6 @@ int main(void) {
     TEST("purpose 48' (unknown)");
     if (ss_keypath_parse(buf, 20, &kp)) {
       FAIL("should reject purpose 48");
-    } else {
-      PASS();
-    }
-  }
-
-  /* Group 9: ss_keypath_format — all four purposes */
-  printf("\n--- Group 9: ss_keypath_format ---\n");
-  test_format("format m/44'/0'/0'/0/0",
-              (ss_keypath_t){SS_SCRIPT_P2PKH, 44, 0, 0, 0, 0},
-              "m/44'/0'/0'/0/0");
-  test_format("format m/49'/0'/0'/0/0",
-              (ss_keypath_t){SS_SCRIPT_P2SH_P2WPKH, 49, 0, 0, 0, 0},
-              "m/49'/0'/0'/0/0");
-  test_format("format m/84'/0'/0'/0/0",
-              (ss_keypath_t){SS_SCRIPT_P2WPKH, 84, 0, 0, 0, 0},
-              "m/84'/0'/0'/0/0");
-  test_format("format m/86'/0'/0'/0/0",
-              (ss_keypath_t){SS_SCRIPT_P2TR, 86, 0, 0, 0, 0},
-              "m/86'/0'/0'/0/0");
-
-  /* Group 10: ss_keypath_format — non-zero fields + overflow */
-  printf("\n--- Group 10: ss_keypath_format edge cases ---\n");
-  test_format("format m/84'/1'/5'/1/42",
-              (ss_keypath_t){SS_SCRIPT_P2WPKH, 84, 1, 5, 1, 42},
-              "m/84'/1'/5'/1/42");
-  {
-    ss_keypath_t kp = {SS_SCRIPT_P2PKH, 44, 0, 0, 0, 0};
-    char tiny[5]; /* too small for "m/44'..." */
-    TEST("format overflow rejected");
-    if (ss_keypath_format(&kp, tiny, sizeof(tiny))) {
-      FAIL("should return false on overflow");
     } else {
       PASS();
     }

@@ -23,15 +23,20 @@ static void codec_zfree(voidpf opaque, voidpf address) {
   (void)opaque;
   heap_caps_free(address);
 }
+#else
+static voidpf codec_zalloc(voidpf opaque, uInt items, uInt size) {
+  (void)opaque;
+  return calloc(items, size);
+}
+static void codec_zfree(voidpf opaque, voidpf address) {
+  (void)opaque;
+  free(address);
+}
 #endif
 
 static void stream_set_allocator(z_stream *stream) {
-#ifdef ESP_PLATFORM
   stream->zalloc = codec_zalloc;
   stream->zfree = codec_zfree;
-#else
-  (void)stream;
-#endif
 }
 
 uint8_t *deflate_compress_raw_alloc(const uint8_t *source, size_t source_len,
@@ -88,7 +93,7 @@ static uint8_t *inflate_alloc(const uint8_t *source, size_t source_len,
                               size_t *dest_len, int window_bits,
                               size_t max_output) {
   if (!source || source_len == 0 || !dest_len || max_output == 0 ||
-      source_len > UINT_MAX) {
+      max_output == SIZE_MAX || source_len > UINT_MAX) {
     return NULL;
   }
 
@@ -105,7 +110,8 @@ static uint8_t *inflate_alloc(const uint8_t *source, size_t source_len,
                    : DEFLATE_CODEC_INITIAL_OUTPUT;
   }
 
-  uint8_t *dest = (uint8_t *)malloc(capacity);
+  // Reserve a terminator without counting it against the decoded byte limit.
+  uint8_t *dest = (uint8_t *)malloc(capacity + 1);
   if (!dest) {
     inflateEnd(&stream);
     return NULL;
@@ -144,7 +150,7 @@ static uint8_t *inflate_alloc(const uint8_t *source, size_t source_len,
 
     size_t used = (size_t)stream.total_out;
     size_t new_capacity = capacity > max_output / 2 ? max_output : capacity * 2;
-    uint8_t *grown = (uint8_t *)realloc(dest, new_capacity);
+    uint8_t *grown = (uint8_t *)realloc(dest, new_capacity + 1);
     if (!grown) {
       inflateEnd(&stream);
       free(dest);
@@ -161,11 +167,12 @@ static uint8_t *inflate_alloc(const uint8_t *source, size_t source_len,
   inflateEnd(&stream);
 
   if (actual_len > 0) {
-    uint8_t *shrunk = (uint8_t *)realloc(dest, actual_len);
+    uint8_t *shrunk = (uint8_t *)realloc(dest, actual_len + 1);
     if (shrunk) {
       dest = shrunk;
     }
   }
+  dest[actual_len] = '\0';
   *dest_len = actual_len;
   return dest;
 }

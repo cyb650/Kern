@@ -1,5 +1,6 @@
 #include "bsp/crowpanel.h"
 #include "bsp/display.h"
+#include "bsp/display_security.h"
 #include "bsp/touch.h"
 #include "bsp_err_check.h"
 #include "driver/gpio.h"
@@ -181,7 +182,6 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config,
   esp_lcd_dsi_bus_config_t bus_config = {
       .bus_id = 0,
       .num_data_lanes = BSP_LCD_MIPI_DSI_LANE_NUM,
-      .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
       .lane_bit_rate_mbps = BSP_LCD_MIPI_DSI_LANE_BITRATE_MBPS,
   };
   ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus), TAG,
@@ -329,6 +329,9 @@ esp_err_t bsp_touch_new(const bsp_touch_config_t *config,
 static lv_display_t *bsp_display_lcd_init(void) {
   bsp_lcd_handles_t lcd_panels;
   BSP_ERROR_CHECK_RETURN_NULL(bsp_display_new_with_handles(NULL, &lcd_panels));
+  bsp_display_register_sensitive_buffers(
+      lcd_panels.panel, CONFIG_BSP_LCD_DPI_BUFFER_NUMS,
+      (size_t)BSP_LCD_H_RES * BSP_LCD_V_RES * BSP_LCD_BITS_PER_PIXEL / 8);
 
   ESP_LOGD(TAG, "Add LCD screen");
   esp_lv_adapter_display_config_t disp_cfg = {

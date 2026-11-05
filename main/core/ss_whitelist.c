@@ -1,5 +1,6 @@
 #include "ss_whitelist.h"
 #include "key.h"
+#include "miniscript_policy.h"
 #include <stdio.h>
 #include <stdlib.h> /* strtoul */
 #include <string.h>
@@ -53,12 +54,6 @@ bool ss_keypath_parse(const unsigned char *keypath_after_fp,
   return true;
 }
 
-bool ss_keypath_format(const ss_keypath_t *kp, char *buf, size_t buf_size) {
-  int n = snprintf(buf, buf_size, "m/%u'/%u'/%u'/%u/%u", kp->purpose, kp->coin,
-                   kp->account, kp->chain, kp->index);
-  return n >= 0 && (size_t)n < buf_size;
-}
-
 bool ss_keypath_is_whitelisted(const ss_keypath_t *kp, bool is_testnet,
                                uint32_t max_index) {
   if (kp->purpose != 44 && kp->purpose != 49 && kp->purpose != 84 &&
@@ -97,17 +92,10 @@ static uint32_t ss_purpose_for_script(ss_script_type_t script) {
 }
 
 static script_template_type_t ss_template_for_script(ss_script_type_t script) {
-  switch (script) {
-  case SS_SCRIPT_P2PKH:
-    return SCRIPT_TEMPLATE_P2PKH;
-  case SS_SCRIPT_P2SH_P2WPKH:
-    return SCRIPT_TEMPLATE_P2SH_P2WPKH;
-  case SS_SCRIPT_P2WPKH:
-    return SCRIPT_TEMPLATE_P2WPKH;
-  case SS_SCRIPT_P2TR:
-  default:
+  script_template_type_t type = SCRIPT_TEMPLATE_P2TR;
+  if (!script_template_for_purpose(ss_purpose_for_script(script), &type))
     return SCRIPT_TEMPLATE_P2TR;
-  }
+  return type;
 }
 
 static bool ss_derive_key(ss_script_type_t script, uint32_t account,
@@ -188,20 +176,62 @@ bool ss_address(ss_script_type_t script, uint32_t account, uint32_t chain,
   return true;
 }
 
-bool purpose_script_binding_check_strict(uint32_t purpose,
-                                         ss_script_type_t outer_script) {
-  switch (purpose) {
-  case 44:
-    return outer_script == SS_SCRIPT_P2PKH;
-  case 49:
-    return outer_script == SS_SCRIPT_P2SH_P2WPKH;
-  case 84:
-    return outer_script == SS_SCRIPT_P2WPKH;
-  case 86:
-    return outer_script == SS_SCRIPT_P2TR;
-  default:
+bool ss_chain_open(ss_script_type_t script, uint32_t account, uint32_t chain,
+                   bool is_testnet, ss_chain_t *out) {
+  if (!out)
     return false;
-  }
+  memset(out, 0, sizeof(*out));
+  uint32_t purpose = ss_purpose_for_script(script);
+  if (purpose == 0 || bip32_path_is_hardened(chain))
+    return false;
+  const uint32_t path[] = {
+      BIP32_PATH_HARDENED | purpose,
+      BIP32_PATH_HARDENED | (is_testnet ? 1u : 0u),
+      BIP32_PATH_HARDENED | account,
+      chain,
+  };
+  if (!key_get_public_key_components(path, sizeof(path) / sizeof(path[0]),
+                                     &out->key))
+    return false;
+  out->script = script;
+  out->is_testnet = is_testnet;
+  return true;
+}
+
+bool ss_chain_scriptpubkey(const ss_chain_t *c, uint32_t index, uint8_t *out,
+                           size_t *out_len) {
+  struct ext_key child;
+  if (!c || !c->key || bip32_path_is_hardened(index) ||
+      bip32_key_from_parent(c->key, index,
+                            BIP32_FLAG_KEY_PUBLIC | BIP32_FLAG_SKIP_HASH,
+                            &child) != WALLY_OK)
+    return false;
+  bool ok = script_template_from_pubkey(ss_template_for_script(c->script),
+                                        child.pub_key, EC_PUBLIC_KEY_LEN, out,
+                                        out_len, NULL, NULL);
+  wally_bzero(&child, sizeof(child));
+  return ok;
+}
+
+bool ss_chain_address(const ss_chain_t *c, uint32_t index, char *out,
+                      size_t out_len) {
+  uint8_t spk[34];
+  size_t spk_len = 0;
+  if (!out || !ss_chain_scriptpubkey(c, index, spk, &spk_len))
+    return false;
+  char *address = script_template_address_from_spk(spk, spk_len, c->is_testnet);
+  bool ok = address && strlen(address) < out_len;
+  if (ok)
+    memcpy(out, address, strlen(address) + 1);
+  wally_free_string(address);
+  return ok;
+}
+
+void ss_chain_close(ss_chain_t *c) {
+  if (c && c->key)
+    bip32_key_free(c->key);
+  if (c)
+    memset(c, 0, sizeof(*c));
 }
 
 psb_result_t
@@ -219,28 +249,13 @@ purpose_script_binding_check_soft(const struct wally_descriptor *desc) {
   bool is_wsh = (strncmp(canon, "wsh(", 4) == 0);
   bool is_sh_wsh = (strncmp(canon, "sh(wsh(", 7) == 0);
 
-  /* tr(KEY,<tree>) carries a taproot script tree; a key expression has no
-   * top-level comma, so the first ',' before ')' marks one. */
-  bool tr_with_tree = false;
-  if (is_tr) {
-    const char *p = canon + 3;
-    while (*p && *p != ',' && *p != ')')
-      p++;
-    tr_with_tree = (*p == ',');
-  }
   wally_free_string(canon);
 
   /* The purpose↔script convention applies to single-sig and plain multisig.
    * A miniscript or taproot script-path policy binds the script to the policy
    * rather than the BIP purpose, so the convention does not apply — skip
-   * rather than warn. get_features reliably flags wsh miniscript (and leaves
-   * multi()/sortedmulti() unset); a taproot tree of pure-descriptor leaves
-   * keeps WALLY_MS_IS_DESCRIPTOR set, so the tr_with_tree scan covers it. */
-  uint32_t features = 0;
-  bool is_miniscript =
-      wally_descriptor_get_features(desc, &features) == WALLY_OK &&
-      (features & WALLY_MS_IS_DESCRIPTOR) == 0;
-  if (tr_with_tree || is_miniscript)
+   * rather than warn. */
+  if (miniscript_policy_is_miniscript(desc))
     return PSB_NA;
 
   /* Step 2: Parse purpose from key[0]'s origin path */

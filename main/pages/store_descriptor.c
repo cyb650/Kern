@@ -1,13 +1,15 @@
 // Store Descriptor Page — save descriptor to flash or SD card
 
 #include "store_descriptor.h"
+#include "../core/bip138_backup.h"
 #include "../core/descriptor_checksum.h"
-#include "../core/registry.h"
 #include "../core/storage.h"
 #include "../core/wallet.h"
 #include "../ui/dialog.h"
 #include "../ui/input_helpers.h"
+#include "../ui/oneshot.h"
 #include "../ui/theme_widgets.h"
+#include "../utils/session_cleanup.h"
 #include "shared/kef_encrypt_page.h"
 
 #include <lvgl.h>
@@ -17,10 +19,10 @@
 
 static lv_obj_t *main_screen = NULL;
 static lv_obj_t *progress_dialog = NULL;
-static lv_timer_t *save_timer = NULL;
+static ui_oneshot_t save_timer;
 static void (*return_callback)(void) = NULL;
 static storage_location_t target_location;
-static bool target_encrypted;
+static storage_descriptor_format_t target_format;
 
 /* Descriptor text to save */
 static char *descriptor_text = NULL;
@@ -56,15 +58,15 @@ static void show_saved(const char *path) {
                    DIALOG_STYLE_OVERLAY);
 }
 
-static void do_save_encrypted(void) {
+static void do_save_kef(void) {
   esp_err_t ret =
       storage_save_descriptor(target_location, pending_id, pending_envelope,
-                              pending_envelope_len, true);
+                              pending_envelope_len, STORAGE_DESCRIPTOR_KEF);
 
   /* Build the path before the cleanup below frees pending_id (page-owned). */
   char path[96];
-  storage_descriptor_path(target_location, pending_id, true, path,
-                          sizeof(path));
+  storage_descriptor_path(target_location, pending_id, STORAGE_DESCRIPTOR_KEF,
+                          path, sizeof(path));
 
   pending_envelope = NULL;
   pending_envelope_len = 0;
@@ -82,10 +84,22 @@ static void do_save_encrypted(void) {
     dialog_show_error_timeout("Failed to save", go_back, 0);
 }
 
-static void do_save_plaintext(const char *id) {
-  esp_err_t ret = storage_save_descriptor(target_location, id,
-                                          (const uint8_t *)descriptor_text,
-                                          strlen(descriptor_text), false);
+/* Plaintext and BIP138 saves share the name prompt; only the bytes differ. */
+static void do_save_named(const char *id) {
+  esp_err_t ret = ESP_FAIL;
+  if (target_format == STORAGE_DESCRIPTOR_BIP138) {
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+    if (bip138_backup_encrypt(descriptor_text, &blob, &blob_len)) {
+      ret = storage_save_descriptor(target_location, id, blob, blob_len,
+                                    STORAGE_DESCRIPTOR_BIP138);
+      free(blob);
+    }
+  } else {
+    ret = storage_save_descriptor(
+        target_location, id, (const uint8_t *)descriptor_text,
+        strlen(descriptor_text), STORAGE_DESCRIPTOR_TXT);
+  }
 
   if (progress_dialog) {
     lv_obj_del(progress_dialog);
@@ -94,7 +108,8 @@ static void do_save_plaintext(const char *id) {
 
   if (ret == ESP_OK) {
     char path[96];
-    storage_descriptor_path(target_location, id, false, path, sizeof(path));
+    storage_descriptor_path(target_location, id, target_format, path,
+                            sizeof(path));
     show_saved(path);
   } else {
     dialog_show_error_timeout("Failed to save", go_back, 0);
@@ -108,13 +123,13 @@ static char pending_plaintext_id[STORAGE_MAX_SANITIZED_ID_LEN + 1];
 static void overwrite_confirm_cb(bool confirmed, void *user_data) {
   (void)user_data;
   if (confirmed) {
-    if (target_encrypted) {
-      do_save_encrypted();
+    if (target_format == STORAGE_DESCRIPTOR_KEF) {
+      do_save_kef();
     } else {
-      do_save_plaintext(pending_plaintext_id);
+      do_save_named(pending_plaintext_id);
     }
   } else {
-    if (target_encrypted) {
+    if (target_format == STORAGE_DESCRIPTOR_KEF) {
       pending_envelope = NULL;
       pending_envelope_len = 0;
       pending_id = NULL;
@@ -132,9 +147,9 @@ static void overwrite_confirm_cb(bool confirmed, void *user_data) {
 
 static void deferred_save_encrypted_cb(lv_timer_t *timer) {
   (void)timer;
-  save_timer = NULL;
 
-  if (storage_descriptor_exists(target_location, pending_id, true)) {
+  if (storage_descriptor_exists(target_location, pending_id,
+                                STORAGE_DESCRIPTOR_KEF)) {
     if (progress_dialog) {
       lv_obj_del(progress_dialog);
       progress_dialog = NULL;
@@ -145,7 +160,7 @@ static void deferred_save_encrypted_cb(lv_timer_t *timer) {
     return;
   }
 
-  do_save_encrypted();
+  do_save_kef();
 }
 
 static void encrypt_return_cb(void) {
@@ -161,17 +176,16 @@ static void encrypt_success_cb(const char *id, const uint8_t *envelope,
 
   progress_dialog =
       dialog_show_progress("KEF", "Saving...", DIALOG_STYLE_OVERLAY);
-  save_timer = lv_timer_create(deferred_save_encrypted_cb, 50, NULL);
-  lv_timer_set_repeat_count(save_timer, 1);
+  ui_oneshot_start(&save_timer, deferred_save_encrypted_cb, 50);
 }
 
 /* ---------- Plaintext path — ID input ---------- */
 
 static void deferred_save_plaintext_cb(lv_timer_t *timer) {
   (void)timer;
-  save_timer = NULL;
 
-  if (storage_descriptor_exists(target_location, pending_plaintext_id, false)) {
+  if (storage_descriptor_exists(target_location, pending_plaintext_id,
+                                target_format)) {
     if (progress_dialog) {
       lv_obj_del(progress_dialog);
       progress_dialog = NULL;
@@ -182,7 +196,12 @@ static void deferred_save_plaintext_cb(lv_timer_t *timer) {
     return;
   }
 
-  do_save_plaintext(pending_plaintext_id);
+  do_save_named(pending_plaintext_id);
+}
+
+static void id_input_back_cb(lv_event_t *e) {
+  (void)e;
+  go_back();
 }
 
 static void id_input_ready_cb(lv_event_t *e) {
@@ -198,21 +217,22 @@ static void id_input_ready_cb(lv_event_t *e) {
 
   progress_dialog = dialog_show_progress("Saving", "Saving descriptor...",
                                          DIALOG_STYLE_OVERLAY);
-  save_timer = lv_timer_create(deferred_save_plaintext_cb, 50, NULL);
-  lv_timer_set_repeat_count(save_timer, 1);
+  ui_oneshot_start(&save_timer, deferred_save_plaintext_cb, 50);
 }
 
 /* ---------- Page lifecycle ---------- */
 
 void store_descriptor_page_create_for_descriptor(
     lv_obj_t *parent, void (*return_cb)(void), storage_location_t location,
-    bool encrypted, const struct wally_descriptor *descriptor) {
+    storage_descriptor_format_t format,
+    const struct wally_descriptor *descriptor) {
+  session_cleanup_register(store_descriptor_page_destroy);
   if (!parent || !descriptor)
     return;
 
   return_callback = return_cb;
   target_location = location;
-  target_encrypted = encrypted;
+  target_format = format;
   descriptor_default_id[0] = '\0';
 
   if (!descriptor_string_from_descriptor(descriptor, &descriptor_text) ||
@@ -226,30 +246,25 @@ void store_descriptor_page_create_for_descriptor(
   const char *title =
       (location == STORAGE_FLASH) ? "Save to Flash" : "Save to SD Card";
   main_screen = theme_create_page_container(parent);
-  lv_obj_t *title_label = lv_label_create(main_screen);
-  lv_label_set_text(title_label, title);
-  lv_obj_set_style_text_font(title_label, theme_font_medium(), 0);
-  lv_obj_set_style_text_color(title_label, primary_color(), 0);
-  lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
 
-  if (encrypted) {
+  if (format == STORAGE_DESCRIPTOR_KEF) {
+    lv_obj_t *title_label = lv_label_create(main_screen);
+    lv_label_set_text(title_label, title);
+    lv_obj_set_style_text_font(title_label, theme_font_medium(), 0);
+    lv_obj_set_style_text_color(title_label, primary_color(), 0);
+    lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
     kef_encrypt_page_create(
         parent, encrypt_return_cb, encrypt_success_cb,
         (const uint8_t *)descriptor_text, strlen(descriptor_text),
-        descriptor_default_id[0] ? descriptor_default_id : NULL);
+        descriptor_default_id[0] ? descriptor_default_id : NULL, false);
   } else {
-    /* Show ID text input for plaintext save */
-    ui_text_input_create(&id_input, parent, "Descriptor name", false,
+    theme_create_page_title(main_screen, title);
+    ui_create_back_button(main_screen, id_input_back_cb);
+    ui_text_input_create(&id_input, main_screen, "Descriptor name", false,
                          id_input_ready_cb);
+    lv_textarea_set_text(id_input.textarea, descriptor_default_id);
     id_input_created = true;
   }
-}
-
-void store_descriptor_page_create(lv_obj_t *parent, void (*return_cb)(void),
-                                  storage_location_t location, bool encrypted) {
-  const registry_entry_t *entry = registry_get(0);
-  store_descriptor_page_create_for_descriptor(
-      parent, return_cb, location, encrypted, entry ? entry->desc : NULL);
 }
 
 void store_descriptor_page_show(void) {
@@ -263,10 +278,8 @@ void store_descriptor_page_hide(void) {
 }
 
 void store_descriptor_page_destroy(void) {
-  if (save_timer) {
-    lv_timer_del(save_timer);
-    save_timer = NULL;
-  }
+  session_cleanup_unregister(store_descriptor_page_destroy);
+  ui_oneshot_cancel(&save_timer);
   if (progress_dialog) {
     lv_obj_del(progress_dialog);
     progress_dialog = NULL;

@@ -8,6 +8,7 @@
 #include "../../ui/theme_widgets.h"
 #include "../../ui/word_selector.h"
 #include "../../utils/bip39_filter.h"
+#include "../../utils/session_cleanup.h"
 #include "../shared/mnemonic_editor.h"
 #include <lvgl.h>
 #include <stdio.h>
@@ -91,6 +92,7 @@ static void show_word_confirmation(const char *word) {
   snprintf(msg, sizeof(msg), "Word %d: %s", current_word_index + 1, word);
 
   dialog_show_confirm(msg, word_confirmation_cb, NULL, DIALOG_STYLE_OVERLAY);
+  secure_memzero(msg, sizeof(msg));
 }
 
 static void word_confirmation_cb(bool confirmed, void *user_data) {
@@ -339,6 +341,7 @@ static void finish_mnemonic(void) {
   mnemonic_editor_page_create(lv_screen_active(), return_callback,
                               success_callback, mnemonic, checksum_filter_mode);
   mnemonic_editor_page_show();
+  secure_memzero(mnemonic, sizeof(mnemonic));
 }
 
 static bool create_page(lv_obj_t *parent, void (*return_cb)(void),
@@ -371,6 +374,7 @@ static bool create_page(lv_obj_t *parent, void (*return_cb)(void),
 void manual_input_page_create(lv_obj_t *parent, void (*return_cb)(void),
                               void (*success_cb)(void),
                               bool checksum_filter_last_word) {
+  session_cleanup_register(manual_input_page_destroy);
   word_count_preselected = false;
   if (!create_page(parent, return_cb, success_cb, checksum_filter_last_word))
     return;
@@ -383,6 +387,7 @@ void manual_input_page_create_with_word_count(lv_obj_t *parent,
                                               void (*success_cb)(void),
                                               bool checksum_filter_last_word,
                                               int word_count) {
+  session_cleanup_register(manual_input_page_destroy);
   if (word_count != 12 && word_count != 24)
     return;
 
@@ -413,6 +418,7 @@ void manual_input_page_hide(void) {
 }
 
 void manual_input_page_destroy(void) {
+  session_cleanup_unregister(manual_input_page_destroy);
   cleanup_ui();
 
   if (manual_input_screen) {

@@ -1,9 +1,12 @@
 #include "descriptor_loader.h"
 #include "../../../components/cUR/src/types/bytes_type.h"
 #include "../../../components/cUR/src/types/output.h"
+#include "../../core/descriptor_text.h"
 #include "../../core/key.h"
 #include "../../core/miniscript_policy.h"
+#include "../../core/multisig_setup.h"
 #include "../../core/registry.h"
+#include "../../core/storage.h"
 #include "../../core/wallet.h"
 #include "../../qr/parser.h"
 #include "../../qr/scanner.h"
@@ -14,170 +17,10 @@
 #include "../../ui/menu.h"
 #include "../../ui/text_fit.h"
 #include "../../ui/theme_widgets.h"
-#include <ctype.h>
+#include "../../utils/session_cleanup.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wally_core.h>
-
-// Convert extended pubkey with non-standard version bytes to xpub/tpub.
-// Handles Zpub, Ypub (mainnet) and Vpub, Upub (testnet).
-static char *convert_xpub_version(const char *key) {
-  static const struct {
-    uint8_t from[4], to[4];
-  } version_map[] = {
-      {{0x02, 0xaa, 0x7e, 0xd3}, {0x04, 0x88, 0xb2, 0x1e}}, // Zpub -> xpub
-      {{0x02, 0x95, 0xb4, 0x3f}, {0x04, 0x88, 0xb2, 0x1e}}, // Ypub -> xpub
-      {{0x04, 0x5f, 0x1c, 0xf6}, {0x04, 0x35, 0x87, 0xcf}}, // Vpub -> tpub
-      {{0x04, 0x4a, 0x52, 0x62}, {0x04, 0x35, 0x87, 0xcf}}, // Upub -> tpub
-  };
-
-  uint8_t decoded[78 + BASE58_CHECKSUM_LEN];
-  size_t written = 0;
-  if (wally_base58_to_bytes(key, BASE58_FLAG_CHECKSUM, decoded, sizeof(decoded),
-                            &written) != WALLY_OK ||
-      written != 78)
-    return NULL;
-
-  for (size_t i = 0; i < sizeof(version_map) / sizeof(version_map[0]); i++) {
-    if (memcmp(decoded, version_map[i].from, 4) == 0) {
-      memcpy(decoded, version_map[i].to, 4);
-      goto encode;
-    }
-  }
-
-  // Already xpub/tpub — re-encode unchanged
-  if (memcmp(decoded, "\x04\x88\xb2\x1e", 4) != 0 &&
-      memcmp(decoded, "\x04\x35\x87\xcf", 4) != 0)
-    return NULL;
-
-encode:;
-  char *wally_str = NULL;
-  if (wally_base58_from_bytes(decoded, written, BASE58_FLAG_CHECKSUM,
-                              &wally_str) != WALLY_OK)
-    return NULL;
-  char *result = strdup(wally_str);
-  wally_free_string(wally_str);
-  return result;
-}
-
-// Parse BlueWallet multisig setup file into a standard descriptor.
-// 15 keys is libwally's CHECKMULTISIG generation cap, enforced for all
-// descriptors by VALIDATION_UNSUPPORTED_SCRIPT.
-#define BLUEWALLET_MAX_KEYS 15
-static char *bluewallet_to_descriptor(const char *text) {
-  if (!text)
-    return NULL;
-
-  const char *policy_line = strstr(text, "Policy:");
-  const char *deriv_line = strstr(text, "Derivation:");
-  const char *format_line = strstr(text, "Format:");
-  if (!policy_line || !deriv_line || !format_line)
-    return NULL;
-
-  unsigned int threshold = 0, num_keys = 0;
-  if (sscanf(policy_line, "Policy: %u of %u", &threshold, &num_keys) != 2 ||
-      threshold == 0 || num_keys == 0 || threshold > num_keys ||
-      num_keys > BLUEWALLET_MAX_KEYS)
-    return NULL;
-
-  char derivation[64] = {0};
-  if (sscanf(deriv_line, "Derivation: %63s", derivation) != 1)
-    return NULL;
-  const char *origin_path = derivation;
-  if (origin_path[0] == 'm' && origin_path[1] == '/')
-    origin_path += 2;
-
-  char format[16] = {0};
-  sscanf(format_line, "Format: %15s", format);
-  const char *wrapper_open, *wrapper_close;
-  if (strcasecmp(format, "P2WSH") == 0) {
-    wrapper_open = "wsh(";
-    wrapper_close = ")";
-  } else if (strcasecmp(format, "P2SH-P2WSH") == 0 ||
-             strcasecmp(format, "P2WSH-P2SH") == 0) {
-    wrapper_open = "sh(wsh(";
-    wrapper_close = "))";
-  } else if (strcasecmp(format, "P2SH") == 0) {
-    wrapper_open = "sh(";
-    wrapper_close = ")";
-  } else {
-    return NULL;
-  }
-
-  char fingerprints[BLUEWALLET_MAX_KEYS][9];
-  char *xpubs[BLUEWALLET_MAX_KEYS];
-  unsigned int found_keys = 0;
-  memset(xpubs, 0, sizeof(xpubs));
-
-  const char *line = text;
-  while (*line && found_keys < num_keys) {
-    while (*line == ' ' || *line == '\t')
-      line++;
-
-    if (strlen(line) > 10) {
-      bool is_hex = true;
-      for (int i = 0; i < 8 && is_hex; i++)
-        is_hex = isxdigit((unsigned char)line[i]);
-
-      if (is_hex && line[8] == ':' && line[9] == ' ') {
-        for (int i = 0; i < 8; i++)
-          fingerprints[found_keys][i] = tolower((unsigned char)line[i]);
-        fingerprints[found_keys][8] = '\0';
-
-        const char *key_start = line + 10;
-        const char *key_end = key_start;
-        while (*key_end && *key_end != '\n' && *key_end != '\r' &&
-               *key_end != ' ')
-          key_end++;
-
-        char *raw_key = malloc(key_end - key_start + 1);
-        if (!raw_key)
-          goto cleanup;
-        memcpy(raw_key, key_start, key_end - key_start);
-        raw_key[key_end - key_start] = '\0';
-
-        xpubs[found_keys] = convert_xpub_version(raw_key);
-        free(raw_key);
-        if (!xpubs[found_keys])
-          goto cleanup;
-        found_keys++;
-      }
-    }
-
-    while (*line && *line != '\n')
-      line++;
-    if (*line == '\n')
-      line++;
-  }
-
-  if (found_keys != num_keys)
-    goto cleanup;
-
-  size_t desc_size = 64;
-  for (unsigned int i = 0; i < num_keys; i++)
-    desc_size += 8 + strlen(origin_path) + strlen(xpubs[i]) + 5;
-
-  char *descriptor = malloc(desc_size);
-  if (!descriptor)
-    goto cleanup;
-
-  int pos = snprintf(descriptor, desc_size, "%ssortedmulti(%u", wrapper_open,
-                     threshold);
-  for (unsigned int i = 0; i < num_keys; i++)
-    pos += snprintf(descriptor + pos, desc_size - pos, ",[%s/%s]%s",
-                    fingerprints[i], origin_path, xpubs[i]);
-  snprintf(descriptor + pos, desc_size - pos, ")%s", wrapper_close);
-
-  for (unsigned int i = 0; i < found_keys; i++)
-    free(xpubs[i]);
-  return descriptor;
-
-cleanup:
-  for (unsigned int i = 0; i < found_keys; i++)
-    free(xpubs[i]);
-  return NULL;
-}
 
 bool descriptor_loader_show_error(descriptor_validation_result_t result) {
   switch (result) {
@@ -202,7 +45,8 @@ bool descriptor_loader_show_error(descriptor_validation_result_t result) {
     return true;
 
   case VALIDATION_XPUB_MISMATCH:
-    dialog_show_error_timeout("XPub mismatch - check passphrase", NULL, 2000);
+    dialog_show_error_timeout("A key with your fingerprint is not yours", NULL,
+                              3000);
     return true;
 
   case VALIDATION_PARSE_ERROR:
@@ -219,9 +63,32 @@ bool descriptor_loader_show_error(descriptor_validation_result_t result) {
                               NULL, 3000);
     return true;
 
+  case VALIDATION_UNSUPPORTED_TOP_LEVEL:
+    dialog_show_error_timeout("Descriptor type not supported (use sh, wsh or "
+                              "tr)",
+                              NULL, 3000);
+    return true;
+
   case VALIDATION_UNSUPPORTED_SCRIPT:
     dialog_show_error_timeout("Script too large (max 15 multisig keys)", NULL,
                               3000);
+    return true;
+
+  case VALIDATION_PRIVATE_KEY:
+    dialog_show_error_timeout("Descriptor contains a private key", NULL, 2500);
+    return true;
+
+  case VALIDATION_TOO_MANY_KEYS: {
+    char msg[40];
+    snprintf(msg, sizeof(msg), "Too many keys (max %d)",
+             DESCRIPTOR_INFO_MAX_KEYS);
+    dialog_show_error_timeout(msg, NULL, 3000);
+    return true;
+  }
+
+  case VALIDATION_UNSUPPORTED_KEY_ORIGIN:
+    dialog_show_error_timeout("Your key's derivation path is not supported",
+                              NULL, 3000);
     return true;
 
   case VALIDATION_TR_INTERNAL_NOT_UNSPENDABLE:
@@ -247,8 +114,20 @@ bool descriptor_loader_show_error(descriptor_validation_result_t result) {
   }
 }
 
+void descriptor_loader_show_rejected_notice(void) {
+  size_t rejected = registry_rejected_count();
+  if (rejected == 0)
+    return;
+  char msg[96];
+  snprintf(msg, sizeof(msg),
+           "%zu registered descriptor%s failed verification and %s not loaded",
+           rejected, rejected == 1 ? "" : "s", rejected == 1 ? "was" : "were");
+  dialog_show_info("Warning", msg, NULL, NULL, DIALOG_STYLE_OVERLAY);
+}
+
 typedef struct {
   void (*proceed)(const char *id, storage_location_t loc, void *user_data);
+  storage_location_t loc;
   ui_text_input_t input;
   /* Wrapper screen owning the textarea + eye-btn so they cascade-delete
    * with the screen on teardown (ui_text_input_destroy only kills the
@@ -259,6 +138,17 @@ typedef struct {
 } id_prompt_ctx_t;
 
 static id_prompt_ctx_t *g_id_prompt_ctx = NULL;
+
+static void id_prompt_cleanup(void) {
+  session_cleanup_unregister(id_prompt_cleanup);
+  if (!g_id_prompt_ctx)
+    return;
+  ui_text_input_destroy(&g_id_prompt_ctx->input);
+  if (g_id_prompt_ctx->screen)
+    lv_obj_delete(g_id_prompt_ctx->screen);
+  free(g_id_prompt_ctx);
+  g_id_prompt_ctx = NULL;
+}
 
 static void id_prompt_ready_cb(lv_event_t *e) {
   (void)e;
@@ -276,15 +166,34 @@ static void id_prompt_ready_cb(lv_event_t *e) {
 
   void (*proceed)(const char *, storage_location_t, void *) =
       g_id_prompt_ctx->proceed;
-  ui_text_input_destroy(&g_id_prompt_ctx->input);
-  if (g_id_prompt_ctx->screen) {
-    lv_obj_del(g_id_prompt_ctx->screen);
-    g_id_prompt_ctx->screen = NULL;
-  }
-  free(g_id_prompt_ctx);
-  g_id_prompt_ctx = NULL;
+  storage_location_t loc = g_id_prompt_ctx->loc;
+  id_prompt_cleanup();
 
-  proceed(id_copy, STORAGE_FLASH, NULL);
+  proceed(id_copy, loc, NULL);
+}
+
+static void prompt_descriptor_name(storage_location_t loc, const char *prefill,
+                                   void (*proceed)(const char *id,
+                                                   storage_location_t loc,
+                                                   void *user_data)) {
+  id_prompt_ctx_t *ctx = malloc(sizeof(id_prompt_ctx_t));
+  if (!ctx) {
+    proceed(NULL, loc, NULL);
+    return;
+  }
+  ctx->proceed = proceed;
+  ctx->loc = loc;
+  memset(&ctx->input, 0, sizeof(ctx->input));
+  ctx->screen = lv_obj_create(lv_screen_active());
+  lv_obj_set_size(ctx->screen, LV_PCT(100), LV_PCT(100));
+  theme_apply_screen(ctx->screen);
+  lv_obj_clear_flag(ctx->screen, LV_OBJ_FLAG_SCROLLABLE);
+  g_id_prompt_ctx = ctx;
+  session_cleanup_register(id_prompt_cleanup);
+  ui_text_input_create(&ctx->input, ctx->screen, "Descriptor name", false,
+                       id_prompt_ready_cb);
+  if (prefill && prefill[0])
+    lv_textarea_set_text(ctx->input.textarea, prefill);
 }
 
 static void descriptor_id_loc_wrapper(void (*proceed)(const char *id,
@@ -292,20 +201,95 @@ static void descriptor_id_loc_wrapper(void (*proceed)(const char *id,
                                                       void *user_data),
                                       void *user_data) {
   (void)user_data;
-  id_prompt_ctx_t *ctx = malloc(sizeof(id_prompt_ctx_t));
-  if (!ctx) {
-    proceed(NULL, STORAGE_FLASH, NULL);
+  prompt_descriptor_name(STORAGE_FLASH, NULL, proceed);
+}
+
+/* ---------- Post-load chooser: session only, or register ---------- */
+
+static ui_menu_t *loaded_menu = NULL;
+static void (*loaded_done_cb)(void) = NULL;
+static char loaded_session_id[REGISTRY_ID_MAX_LEN];
+
+static void loaded_finish(void) {
+  void (*done)(void) = loaded_done_cb;
+  loaded_done_cb = NULL;
+  if (done)
+    done();
+}
+
+static void loaded_finish_dialog_cb(void *user_data) {
+  (void)user_data;
+  loaded_finish();
+}
+
+static void loaded_destroy_menu(void) {
+  if (loaded_menu) {
+    ui_menu_destroy(loaded_menu);
+    loaded_menu = NULL;
+  }
+}
+
+static void loaded_session_only_cb(void) {
+  loaded_destroy_menu();
+  loaded_finish();
+}
+
+static void loaded_register(void);
+
+static void loaded_name_taken_cb(void) { loaded_register(); }
+
+static void loaded_register_named_cb(const char *name, storage_location_t loc,
+                                     void *user_data) {
+  (void)loc;
+  (void)user_data;
+  if (!name || name[0] == '\0') {
+    loaded_finish();
     return;
   }
-  ctx->proceed = proceed;
-  memset(&ctx->input, 0, sizeof(ctx->input));
-  ctx->screen = lv_obj_create(lv_screen_active());
-  lv_obj_set_size(ctx->screen, LV_PCT(100), LV_PCT(100));
-  theme_apply_screen(ctx->screen);
-  lv_obj_clear_flag(ctx->screen, LV_OBJ_FLAG_SCROLLABLE);
-  g_id_prompt_ctx = ctx;
-  ui_text_input_create(&ctx->input, ctx->screen, "Descriptor name", false,
-                       id_prompt_ready_cb);
+  if (storage_descriptor_exists(STORAGE_FLASH, name,
+                                STORAGE_DESCRIPTOR_BIP138)) {
+    dialog_show_error_timeout("A registered descriptor already uses this name",
+                              loaded_name_taken_cb, 0);
+    return;
+  }
+  if (!registry_persist(loaded_session_id, name)) {
+    dialog_show_error_timeout("Could not register the descriptor",
+                              loaded_finish, 0);
+    return;
+  }
+  char msg[160];
+  snprintf(msg, sizeof(msg),
+           "%s registered.\nIt loads automatically with this key.", name);
+  dialog_show_info("Registered", msg, loaded_finish_dialog_cb, NULL,
+                   DIALOG_STYLE_FULLSCREEN);
+}
+
+static void loaded_register(void) {
+  loaded_destroy_menu();
+  const registry_entry_t *entry = registry_find_by_id(loaded_session_id);
+  prompt_descriptor_name(STORAGE_FLASH, entry ? entry->label : NULL,
+                         loaded_register_named_cb);
+}
+
+void descriptor_loader_show_loaded_menu(void (*done_cb)(void)) {
+  loaded_destroy_menu();
+  loaded_done_cb = done_cb;
+  if (!descriptor_validator_get_loaded_id(loaded_session_id,
+                                          sizeof(loaded_session_id))) {
+    loaded_finish();
+    return;
+  }
+  loaded_menu = ui_menu_create(lv_screen_active(), "Descriptor Loaded",
+                               loaded_session_only_cb);
+  if (!loaded_menu) {
+    loaded_finish();
+    return;
+  }
+  ui_menu_add_entry(loaded_menu, "Keep for this session only",
+                    loaded_session_only_cb);
+  ui_menu_add_entry_with_icon(loaded_menu, LV_SYMBOL_DRIVE, "Register",
+                              loaded_register);
+  ui_menu_show(loaded_menu);
 }
 
 // UI confirmation wrapper: validator's confirm_cb fires on danger-style
@@ -323,6 +307,10 @@ typedef struct {
   lv_obj_t *root;
 } info_confirm_context_t;
 
+static void info_confirm_deleted(lv_event_t *e) {
+  free(lv_event_get_user_data(e));
+}
+
 static void info_confirm_respond(lv_event_t *e, bool confirmed) {
   info_confirm_context_t *ctx = lv_event_get_user_data(e);
   if (!ctx)
@@ -330,7 +318,6 @@ static void info_confirm_respond(lv_event_t *e, bool confirmed) {
   void (*proceed)(bool, void *) = ctx->proceed;
   if (ctx->root)
     lv_obj_del(ctx->root);
-  free(ctx);
   if (proceed)
     proceed(confirmed, NULL);
 }
@@ -524,6 +511,7 @@ static void descriptor_info_confirm_wrapper(const descriptor_info_t *info,
   theme_apply_screen(root);
   lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
   ctx->root = root;
+  lv_obj_add_event_cb(root, info_confirm_deleted, LV_EVENT_DELETE, ctx);
 
   // Title with "Load?" prompt
   char title[48];
@@ -533,6 +521,9 @@ static void descriptor_info_confirm_wrapper(const descriptor_info_t *info,
   } else if (info->is_multisig) {
     snprintf(title, sizeof(title), "Multisig (%u of %u) - Load?",
              info->threshold, info->num_keys);
+  } else if (info->script_type) {
+    snprintf(title, sizeof(title), "Single-sig (%s) - Load?",
+             info->script_type);
   } else {
     snprintf(title, sizeof(title), "Single-sig - Load?");
   }
@@ -639,7 +630,7 @@ static void descriptor_info_confirm_wrapper(const descriptor_info_t *info,
   }
 
   // Indented miniscript policy with key letters, our keys highlighted
-  if (info->is_miniscript && info->policy[0]) {
+  if (info->is_miniscript && info->policy) {
     char ours[DESCRIPTOR_INFO_MAX_KEYS + 1];
     size_t n_ours = 0;
     for (uint32_t i = 0; my_fp[0] != '\0' && i < info->num_keys; i++)
@@ -684,9 +675,10 @@ void descriptor_loader_process_scanner(validation_complete_cb validation_cb,
   qr_scanner_page_destroy();
 
   if (descriptor_str) {
-    char *converted = bluewallet_to_descriptor(descriptor_str);
+    char *converted = multisig_setup_to_descriptor(descriptor_str);
     const char *to_process = converted ? converted : descriptor_str;
     char *unambiguous = descriptor_to_unambiguous(to_process);
+    session_cleanup_register(descriptor_validation_cancel);
     descriptor_validate_and_load(unambiguous ? unambiguous : to_process,
                                  validation_cb, descriptor_confirm_wrapper,
                                  descriptor_info_confirm_wrapper,
@@ -711,9 +703,10 @@ void descriptor_loader_process_string(const char *descriptor_str,
     return;
   }
 
-  char *converted = bluewallet_to_descriptor(descriptor_str);
+  char *converted = multisig_setup_to_descriptor(descriptor_str);
   const char *to_process = converted ? converted : descriptor_str;
   char *unambiguous = descriptor_to_unambiguous(to_process);
+  session_cleanup_register(descriptor_validation_cancel);
   descriptor_validate_and_load(unambiguous ? unambiguous : to_process,
                                validation_cb, descriptor_confirm_wrapper,
                                descriptor_info_confirm_wrapper,
@@ -731,7 +724,7 @@ void descriptor_loader_process_string_watch_only(
     return;
   }
 
-  char *converted = bluewallet_to_descriptor(descriptor_str);
+  char *converted = multisig_setup_to_descriptor(descriptor_str);
   const char *to_process = converted ? converted : descriptor_str;
   char *unambiguous = descriptor_to_unambiguous(to_process);
   const char *final = unambiguous ? unambiguous : to_process;
@@ -746,6 +739,7 @@ void descriptor_loader_process_string_watch_only(
   }
 
   wallet_set_watch_only(net);
+  session_cleanup_register(descriptor_validation_cancel);
   descriptor_validate_and_load_watch_only(
       final, net, validation_cb, descriptor_info_confirm_wrapper, user_data);
   free(unambiguous);
@@ -761,6 +755,7 @@ void descriptor_loader_show_source_menu(lv_obj_t *parent, void (*qr_cb)(void),
                                         void (*sd_cb)(void),
                                         void (*back_cb)(void)) {
   descriptor_loader_destroy_source_menu();
+  session_cleanup_register(descriptor_loader_destroy_source_menu);
 
   source_menu = ui_menu_create(parent, "Load Descriptor", back_cb);
   if (!source_menu)
@@ -774,6 +769,7 @@ void descriptor_loader_show_source_menu(lv_obj_t *parent, void (*qr_cb)(void),
 }
 
 void descriptor_loader_destroy_source_menu(void) {
+  session_cleanup_unregister(descriptor_loader_destroy_source_menu);
   if (source_menu) {
     ui_menu_destroy(source_menu);
     source_menu = NULL;
@@ -814,73 +810,4 @@ char *descriptor_extract_from_scanner(void) {
   }
 
   return qr_scanner_get_completed_content();
-}
-
-static bool is_base58_char(char c) {
-  return (c >= '1' && c <= '9') || (c >= 'A' && c <= 'H') ||
-         (c >= 'J' && c <= 'N') || (c >= 'P' && c <= 'Z') ||
-         (c >= 'a' && c <= 'k') || (c >= 'm' && c <= 'z');
-}
-
-char *descriptor_to_unambiguous(const char *descriptor) {
-  if (!descriptor)
-    return NULL;
-
-  size_t desc_len = strlen(descriptor);
-
-  // Strip checksum if present (#xxxxxxxx)
-  size_t content_len = desc_len;
-  if (desc_len > 9 && descriptor[desc_len - 9] == '#')
-    content_len = desc_len - 9;
-
-  // Count keys needing modification
-  size_t modifications_needed = 0;
-  const char *search = descriptor;
-  const char *content_end = descriptor + content_len;
-
-  while ((search = strstr(search, "pub")) != NULL && search < content_end) {
-    if (search > descriptor && (*(search - 1) == 'x' || *(search - 1) == 't')) {
-      const char *key_end = search + 3;
-      while (key_end < content_end && is_base58_char(*key_end))
-        key_end++;
-
-      if (key_end >= content_end || *key_end != '/')
-        modifications_needed++;
-    }
-    search += 3;
-  }
-
-  if (modifications_needed == 0)
-    return NULL;
-
-  size_t new_len = content_len + (modifications_needed * 8) + 1;
-  char *result = malloc(new_len);
-  if (!result)
-    return NULL;
-
-  const char *src = descriptor;
-  char *dst = result;
-
-  while (src < content_end) {
-    if ((src[0] == 'x' || src[0] == 't') && src + 3 < content_end &&
-        strncmp(src + 1, "pub", 3) == 0) {
-      *dst++ = *src++;
-      *dst++ = *src++;
-      *dst++ = *src++;
-      *dst++ = *src++;
-
-      while (src < content_end && is_base58_char(*src))
-        *dst++ = *src++;
-
-      if (src >= content_end || *src != '/') {
-        memcpy(dst, "/<0;1>/*", 8);
-        dst += 8;
-      }
-    } else {
-      *dst++ = *src++;
-    }
-  }
-  *dst = '\0';
-
-  return result;
 }

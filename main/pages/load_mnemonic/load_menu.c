@@ -7,6 +7,7 @@
 #include "../../ui/assets/icons.h"
 #include "../../ui/menu.h"
 #include "../../ui/theme_widgets.h"
+#include "../../utils/session_cleanup.h"
 #include "../home/home.h"
 #include "../shared/kef_decrypt_page.h"
 #include "../shared/key_confirmation.h"
@@ -227,6 +228,7 @@ static void back_cb(void) {
 }
 
 void load_menu_page_create(lv_obj_t *parent, void (*return_cb)(void)) {
+  session_cleanup_register(load_menu_page_destroy);
   if (!parent)
     return;
 
@@ -261,6 +263,7 @@ void load_menu_page_hide(void) {
 }
 
 void load_menu_page_destroy(void) {
+  session_cleanup_unregister(load_menu_page_destroy);
   destroy_manual_method_menu();
   if (load_menu) {
     ui_menu_destroy(load_menu);

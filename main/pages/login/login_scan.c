@@ -9,6 +9,7 @@
 #include "../../qr/scanner.h"
 #include "../../ui/dialog.h"
 #include "../../utils/secure_mem.h"
+#include "../../utils/session_cleanup.h"
 #include "../home/addresses.h"
 #include "../home/home.h"
 #include "../shared/descriptor_loader.h"
@@ -24,6 +25,7 @@ static void (*s_return_to_login)(void) = NULL;
 static char *s_scan_content = NULL; // raw scan, kept for the unidentified view
 
 static void clear_content(void) {
+  session_cleanup_unregister(clear_content);
   if (s_scan_content) {
     free(s_scan_content);
     s_scan_content = NULL;
@@ -138,10 +140,11 @@ static bool try_mnemonic(const char *content, size_t len) {
     return true;
   }
 
-  // Plaintext / SeedQR: only treat as a mnemonic if it actually validates, so
-  // descriptors fall through to the watch-only path.
+  // Plaintext / SeedQR: only treat as a mnemonic if it actually validates
+  // (mnemonic_qr_to_mnemonic checks), so descriptors fall through to the
+  // watch-only path.
   char *mnemonic = mnemonic_qr_to_mnemonic(content, len, NULL);
-  bool valid = mnemonic && bip39_mnemonic_validate(NULL, mnemonic) == WALLY_OK;
+  bool valid = mnemonic != NULL;
   SECURE_FREE_STRING(mnemonic);
   if (!valid)
     return false;
@@ -197,6 +200,7 @@ static void on_scan_done(void) {
 void login_scan_start(void (*return_to_login_cb)(void)) {
   s_return_to_login = return_to_login_cb;
   clear_content();
+  session_cleanup_register(clear_content);
   qr_scanner_page_create(lv_screen_active(), on_scan_done);
   qr_scanner_page_show();
 }

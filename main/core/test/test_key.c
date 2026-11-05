@@ -8,6 +8,8 @@
 
 #include "../../utils/secure_mem.h"
 #include "../key.h"
+#include "kern_wally.h"
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,9 +17,67 @@
 #include <wally_bip32.h>
 #include <wally_bip39.h>
 #include <wally_core.h>
+#include <wally_crypto.h>
 
 static int tests_run = 0;
 static int tests_failed = 0;
+
+/* Observe the tokenized duplicate while it is still allocated. This tests
+ * key.c's explicit wipe independently of firmware's global release policy. */
+static int fail_after = -1;
+static bool probe_other_thread, other_thread_allocated;
+static void *public_allocation_thread(void *unused) {
+  (void)unused;
+  void *p = wally_malloc(4096);
+  other_thread_allocated = p != NULL;
+  wally_free(p);
+  return NULL;
+}
+static bool deny_secret_allocation(void) {
+  if (fail_after < 0)
+    return false;
+  if (fail_after == 0)
+    return true;
+  --fail_after;
+  return false;
+}
+void *__real_kern_secret_alloc(size_t size);
+void *__wrap_kern_secret_alloc(size_t size) {
+  if (probe_other_thread) {
+    probe_other_thread = false;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, public_allocation_thread, NULL) != 0)
+      abort();
+    pthread_join(thread, NULL);
+  }
+  return deny_secret_allocation() ? NULL : __real_kern_secret_alloc(size);
+}
+static bool track_duplicate, duplicate_wiped;
+static char *tracked_duplicate;
+static size_t tracked_size;
+char *__real_kern_secret_strdup(const char *s);
+void __real_free(void *p);
+char *__wrap_kern_secret_strdup(const char *s) {
+  if (deny_secret_allocation())
+    return NULL;
+  char *p = __real_kern_secret_strdup(s);
+  if (track_duplicate && !tracked_duplicate) {
+    tracked_duplicate = p;
+    tracked_size = strlen(s) + 1;
+  }
+  return p;
+}
+void __wrap_free(void *p) {
+  if (p && p == tracked_duplicate) {
+    duplicate_wiped = true;
+    for (size_t i = 0; i < tracked_size; ++i)
+      if (((unsigned char *)p)[i])
+        duplicate_wiped = false;
+    tracked_duplicate = NULL;
+    track_duplicate = false;
+  }
+  __real_free(p);
+}
 
 static void check(const char *name, bool ok) {
   tests_run++;
@@ -57,8 +117,8 @@ static void fp_hex(const unsigned char fp[4], char out[9]) {
 }
 
 static void test_unloaded(void) {
-  check("init succeeds", key_init());
-  check("not loaded after init", !key_is_loaded());
+  key_unload();
+  check("not loaded after unload", !key_is_loaded());
 
   unsigned char fp[4];
   char hex[9];
@@ -71,7 +131,8 @@ static void test_unloaded(void) {
             !key_get_xpub("m/84'/0'/0'", &s) && !key_get_master_xpub(&s) &&
             !key_get_mnemonic(&s) && !key_get_mnemonic_words(&words, &n) &&
             !key_get_derived_key("m/0", &k) &&
-            !key_get_derived_key_components(NULL, 0, &k));
+            !key_get_derived_key_components(NULL, 0, &k) &&
+            !key_set_network(true));
   key_unload();
   check("unload when unloaded is harmless", !key_is_loaded());
 }
@@ -196,7 +257,10 @@ static void test_mnemonic_access(void) {
 
   char **words = NULL;
   size_t n = 0;
+  track_duplicate = true;
+  duplicate_wiped = false;
   check("mnemonic words split", key_get_mnemonic_words(&words, &n) && n == 12);
+  check("tokenized copy wiped through original terminator", duplicate_wiped);
   check("first and last words", n == 12 && strcmp(words[0], "abandon") == 0 &&
                                     strcmp(words[11], "about") == 0);
   for (size_t i = 0; i < n; i++)
@@ -281,6 +345,55 @@ static void test_passphrase_and_network(void) {
   wally_bzero(&ref, sizeof(ref));
 }
 
+static bool account_xpub_matches(const struct ext_key *ref, uint32_t coin) {
+  uint32_t p[3] = {84 | BIP32_INITIAL_HARDENED_CHILD,
+                   coin | BIP32_INITIAL_HARDENED_CHILD,
+                   0 | BIP32_INITIAL_HARDENED_CHILD};
+  char path[16];
+  snprintf(path, sizeof(path), "m/84'/%u'/0'", (unsigned)coin);
+  struct ext_key d;
+  char *want = NULL, *got = NULL;
+  bool ok = bip32_key_from_parent_path(ref, p, 3, BIP32_FLAG_KEY_PRIVATE, &d) ==
+                WALLY_OK &&
+            bip32_key_to_base58(&d, BIP32_FLAG_KEY_PUBLIC, &want) == WALLY_OK &&
+            key_get_xpub(path, &got) && strcmp(want, got) == 0;
+  wally_free_string(want);
+  wally_free_string(got);
+  wally_bzero(&d, sizeof(d));
+  return ok;
+}
+
+static void test_set_network_keeps_passphrase(void) {
+  struct ext_key main_ref, test_ref;
+  char expect[9], got[9];
+
+  check("references with passphrase",
+        reference_master(TEST_MNEMONIC, "TREZOR", BIP32_VER_MAIN_PRIVATE,
+                         &main_ref) &&
+            reference_master(TEST_MNEMONIC, "TREZOR", BIP32_VER_TEST_PRIVATE,
+                             &test_ref));
+  check("load with passphrase on mainnet",
+        key_load_from_mnemonic(TEST_MNEMONIC, "TREZOR", false) &&
+            key_get_fingerprint_hex(expect));
+
+  check("switch to testnet", key_set_network(true));
+  check("testnet switch keeps the passphrase fingerprint",
+        key_get_fingerprint_hex(got) && strcmp(got, expect) == 0);
+  check("testnet switch derives the passphrase wallet",
+        account_xpub_matches(&test_ref, 1));
+
+  check("switch back to mainnet", key_set_network(false));
+  check("mainnet switch derives the passphrase wallet",
+        account_xpub_matches(&main_ref, 0));
+  char *m = NULL;
+  check("mnemonic survives the switch",
+        key_get_mnemonic(&m) && strcmp(m, TEST_MNEMONIC) == 0);
+  SECURE_FREE_STRING(m);
+
+  wally_bzero(&main_ref, sizeof(main_ref));
+  wally_bzero(&test_ref, sizeof(test_ref));
+}
+
 static void test_unload(void) {
   check("loaded before unload", key_is_loaded());
   key_unload();
@@ -292,11 +405,219 @@ static void test_unload(void) {
   check("reload after unload",
         key_load_from_mnemonic(TEST_MNEMONIC, "", false) &&
             key_get_fingerprint_hex(hex) && strcmp(hex, "73c5da0a") == 0);
-  key_cleanup();
-  check("cleanup unloads", !key_is_loaded());
+  key_unload();
+  check("unload after reload", !key_is_loaded());
+}
+
+static void test_internal_memory_exhaustion(void) {
+  for (int n = 0; n < 3; ++n) {
+    fail_after = n;
+    check("load fails closed at each secret allocation",
+          !key_load_from_mnemonic(TEST_MNEMONIC, "", false) &&
+              !key_is_loaded());
+  }
+  fail_after = -1;
+  check("load recovers after memory becomes available",
+        key_load_from_mnemonic(TEST_MNEMONIC, "", false));
+  fail_after = 0;
+  struct ext_key *derived = NULL;
+  check("master copy has no fallback",
+        !key_get_derived_key("m", &derived) && !derived);
+  check("derived private key has no fallback",
+        !key_get_derived_key("m/84h/0h/0h", &derived) && !derived);
+  char *phrase = NULL;
+  check("mnemonic copy has no fallback", !key_get_mnemonic(&phrase) && !phrase);
+  unsigned char entropy[16] = {0};
+  probe_other_thread = true;
+  other_thread_allocated = false;
+  check("libwally mnemonic generation has no fallback",
+        kern_bip39_mnemonic_from_bytes(NULL, entropy, sizeof(entropy),
+                                       &phrase) == WALLY_ENOMEM &&
+            !phrase);
+  check("secret scope does not constrain a concurrent public-data thread",
+        other_thread_allocated);
+  /* Both copy the mnemonic; with secret memory denied they must fail, not
+   * fall back to the default heap. Validation reports every failure as
+   * WALLY_EINVAL, running out of memory included. */
+  fail_after = 0;
+  check("mnemonic validation copies only into secret memory",
+        kern_bip39_mnemonic_validate(NULL, TEST_MNEMONIC) == WALLY_EINVAL);
+  fail_after = 0;
+  unsigned char decoded[32];
+  size_t decoded_len = 1;
+  check("mnemonic decoding copies only into secret memory",
+        kern_bip39_mnemonic_to_bytes(NULL, TEST_MNEMONIC, decoded,
+                                     sizeof(decoded),
+                                     &decoded_len) == WALLY_ENOMEM &&
+            decoded_len == 0);
+  fail_after = -1;
+  check("mnemonic validation and decoding work with memory",
+        kern_bip39_mnemonic_validate(NULL, TEST_MNEMONIC) == WALLY_OK &&
+            kern_bip39_mnemonic_to_bytes(NULL, TEST_MNEMONIC, decoded,
+                                         sizeof(decoded),
+                                         &decoded_len) == WALLY_OK &&
+            decoded_len == 16);
+  fail_after = 0;
+  void *public_data = wally_malloc(4096);
+  check("public libwally allocation is unaffected and secret scope restored",
+        public_data != NULL);
+  wally_free(public_data);
+  fail_after = 3;
+  char **words = NULL;
+  size_t count = 0;
+  check("partial word allocation failure cleans up without output",
+        !key_get_mnemonic_words(&words, &count) && !words && !count);
+  fail_after = -1;
+  key_unload();
+}
+
+/* BIP-85 BIP39 application, the spec's test vectors (English, index 0). */
+static void test_bip85_vectors(void) {
+  static const char *xprv =
+      "xprv9s21ZrQH143K2LBWUUQRFXhucrQqBpKdRRxNVq2zBqsx8HVqFk2uYo8kmbaLLHRdqtQp"
+      "Um98uKfu3vca1LqdGhUtyoFnCNkfmXRyPXLjbKb";
+  static const struct {
+    uint32_t words;
+    const char *mnemonic;
+  } vectors[] = {
+      {12, "girl mad pet galaxy egg matter matrix prison refuse sense ordinary "
+           "nose"},
+      {18, "near account window bike charge season chef number sketch tomorrow "
+           "excuse sniff circle vital hockey outdoor supply token"},
+      {24,
+       "puppy ocean match cereal symbol another shed magic wrap hammer bulb "
+       "intact gadget divorce twin tonight reason outdoor destroy simple "
+       "truth cigar social volcano"},
+  };
+  struct ext_key *master = NULL;
+  if (bip32_key_from_base58_alloc(xprv, &master) != WALLY_OK) {
+    check("BIP-85 master key parses", false);
+    return;
+  }
+  for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+    char *mnemonic = NULL;
+    char name[48];
+    snprintf(name, sizeof(name), "BIP-85 %u words, index 0",
+             (unsigned)vectors[i].words);
+    check(name, key_bip85_mnemonic(master, vectors[i].words, 0, &mnemonic) &&
+                    strcmp(mnemonic, vectors[i].mnemonic) == 0);
+    SECURE_FREE_STRING(mnemonic);
+    if (i == 0) {
+      check("BIP-85 index 1 is another child",
+            key_bip85_mnemonic(master, 12, 1, &mnemonic) &&
+                strcmp(mnemonic, vectors[0].mnemonic) != 0);
+      SECURE_FREE_STRING(mnemonic);
+    }
+  }
+  char *mnemonic = NULL;
+  check("BIP-85 refuses a word count BIP39 lacks",
+        !key_bip85_mnemonic(master, 13, 0, &mnemonic) && !mnemonic);
+  bip32_key_free(master);
+}
+
+static void other_free(void *p) { free(p); }
+
+/* Secret operations rely on libwally's free_fn releasing kern_secret_alloc
+ * blocks; another free_fn must make them fail closed. */
+static int hook_calls;
+static unsigned char hook_salt[64];
+static size_t hook_salt_len;
+static uint32_t hook_iterations;
+static bool hook_fail;
+
+/* Stands in for the device's accelerated PBKDF2: libwally's own, recording
+ * what kern_wally hands it. */
+static int recording_pbkdf2(const uint8_t *password, size_t password_len,
+                            const uint8_t *salt, size_t salt_len,
+                            uint32_t iterations, uint8_t *key_out,
+                            size_t key_len) {
+  hook_calls++;
+  hook_salt_len = salt_len < sizeof(hook_salt) ? salt_len : sizeof(hook_salt);
+  memcpy(hook_salt, salt, hook_salt_len);
+  hook_iterations = iterations;
+  if (hook_fail)
+    return -1;
+  return wally_pbkdf2_hmac_sha512(password, password_len, salt, salt_len, 0,
+                                  iterations, key_out, key_len) == WALLY_OK
+             ? 0
+             : -1;
+}
+
+static void test_registered_bip39_pbkdf2(void) {
+  struct ext_key ref;
+  unsigned char fp[4];
+  char with_pass[9], plain_24[9], got[9];
+
+  check(
+      "reference keys",
+      reference_master(TEST_MNEMONIC, "TREZOR", BIP32_VER_MAIN_PRIVATE, &ref) &&
+          bip32_key_get_fingerprint(&ref, fp, 4) == WALLY_OK);
+  fp_hex(fp, with_pass);
+  check(
+      "reference 24-word key",
+      reference_master(TEST_MNEMONIC_24, NULL, BIP32_VER_MAIN_PRIVATE, &ref) &&
+          bip32_key_get_fingerprint(&ref, fp, 4) == WALLY_OK);
+  fp_hex(fp, plain_24);
+
+  kern_set_bip39_pbkdf2(recording_pbkdf2);
+  hook_calls = 0;
+  check("registered PBKDF2 derives the same key",
+        key_load_from_mnemonic(TEST_MNEMONIC, "TREZOR", false) &&
+            key_get_fingerprint_hex(got) && strcmp(got, with_pass) == 0);
+  check("  in one call with BIP39's salt and cost",
+        hook_calls == 1 && hook_salt_len == 14 &&
+            memcmp(hook_salt, "mnemonicTREZOR", 14) == 0 &&
+            hook_iterations == 2048);
+  hook_calls = 0;
+  check("registered PBKDF2 with a NULL passphrase salts with 'mnemonic'",
+        key_mnemonic_passphrase_fingerprint_hex(TEST_MNEMONIC_24, NULL, got) &&
+            strcmp(got, plain_24) == 0 && hook_calls == 1 &&
+            hook_salt_len == 8 && memcmp(hook_salt, "mnemonic", 8) == 0);
+
+  hook_fail = true;
+  check("a failing PBKDF2 loads no key",
+        !key_load_from_mnemonic(TEST_MNEMONIC, NULL, false) &&
+            !key_is_loaded());
+  hook_fail = false;
+
+  kern_set_bip39_pbkdf2(NULL);
+  hook_calls = 0;
+  check("unregistered, libwally derives the seed again",
+        key_load_from_mnemonic(TEST_MNEMONIC, NULL, false) &&
+            key_get_fingerprint_hex(got) && strcmp(got, "73c5da0a") == 0 &&
+            hook_calls == 0);
+  key_unload();
+}
+
+static void test_free_fn_change_fails_closed(void) {
+  struct wally_operations ops = {.struct_size = sizeof(ops)};
+  if (wally_get_operations(&ops) != WALLY_OK) {
+    check("read libwally operations", false);
+    return;
+  }
+  struct wally_operations swapped = ops;
+  swapped.free_fn = other_free;
+  unsigned char entropy[16] = {0};
+  char *phrase = NULL;
+  bool refused = wally_set_operations(&swapped) == WALLY_OK &&
+                 kern_bip39_mnemonic_from_bytes(NULL, entropy, sizeof(entropy),
+                                                &phrase) == WALLY_ERROR &&
+                 !phrase;
+  bool restored = wally_set_operations(&ops) == WALLY_OK &&
+                  kern_bip39_mnemonic_from_bytes(NULL, entropy, sizeof(entropy),
+                                                 &phrase) == WALLY_OK;
+  SECURE_FREE_STRING(phrase);
+  check("a swapped free_fn makes secret operations fail closed",
+        refused && restored);
 }
 
 int main(void) {
+  /* The host libwally hashes through PSA, as the device does, which needs
+   * wally_init. */
+  if (wally_init(0) != WALLY_OK) {
+    printf("ABORT: wally_init failed\n");
+    return 1;
+  }
   printf("=== key tests ===\n\n");
   test_unloaded();
   test_load_and_reject();
@@ -304,7 +625,12 @@ int main(void) {
   test_derived_keys();
   test_mnemonic_access();
   test_passphrase_and_network();
+  test_set_network_keeps_passphrase();
   test_unload();
+  test_internal_memory_exhaustion();
+  test_free_fn_change_fails_closed();
+  test_registered_bip39_pbkdf2();
+  test_bip85_vectors();
   printf("\nResults: %d passed, %d failed\n", tests_run - tests_failed,
          tests_failed);
   return tests_failed == 0 ? 0 : 1;

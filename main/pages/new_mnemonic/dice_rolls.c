@@ -1,26 +1,24 @@
 // Dice Rolls Page - Generate mnemonic entropy from dice rolls
 
 #include "dice_rolls.h"
+#include "../../core/dice_mnemonic.h"
 #include "../../ui/dialog.h"
 #include "../../ui/input_helpers.h"
 #include "../../ui/theme_widgets.h"
 #include "../../ui/word_selector.h"
 #include "../../utils/dice_quality.h"
+#include "../../utils/session_cleanup.h"
+#include "secure_memory.h"
 #include <lvgl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wally_bip39.h>
-#include <wally_core.h>
-#include <wally_crypto.h>
 
 #include "../../utils/secure_mem.h"
 
 #define MIN_ROLLS_12_WORDS 50
 #define MIN_ROLLS_24_WORDS 99
 #define MAX_ROLLS 256
-#define ENTROPY_12_WORDS 16
-#define ENTROPY_24_WORDS 32
 #define TARGET_ESTIMATED_ENTROPY_12_WORDS 128
 #define TARGET_ESTIMATED_ENTROPY_24_WORDS 256
 
@@ -153,6 +151,7 @@ static void update_display(void) {
     char display[MAX_ROLLS + 2];
     snprintf(display, sizeof(display), "%s_", rolls_string);
     lv_label_set_text(rolls_label, display);
+    secure_memzero(display, sizeof(display));
 
     // Compute the vertical space available for the rolls label:
     // from just below the "..." position down to just above the keypad.
@@ -298,30 +297,14 @@ static bool generate_mnemonic_from_rolls(void) {
   if (rolls_count < min_rolls)
     return false;
 
-  size_t entropy_len =
-      (total_words == 12) ? ENTROPY_12_WORDS : ENTROPY_24_WORDS;
-
-  unsigned char hash[SHA256_LEN];
-  if (wally_sha256((const unsigned char *)rolls_string, rolls_count, hash,
-                   sizeof(hash)) != WALLY_OK)
-    return false;
-
   char *mnemonic = NULL;
-  if (bip39_mnemonic_from_bytes(NULL, hash, entropy_len, &mnemonic) !=
-          WALLY_OK ||
-      !mnemonic)
+  if (!dice_mnemonic_from_rolls(rolls_string, (size_t)rolls_count, total_words,
+                                &mnemonic))
     return false;
-
-  if (bip39_mnemonic_validate(NULL, mnemonic) != WALLY_OK) {
-    wally_free_string(mnemonic);
-    return false;
-  }
 
   SECURE_FREE_STRING(completed_mnemonic);
-  completed_mnemonic = strdup(mnemonic);
-  wally_free_string(mnemonic);
+  completed_mnemonic = mnemonic;
 
-  secure_memzero(hash, sizeof(hash));
   secure_memzero(rolls_string, sizeof(rolls_string));
   rolls_count = 0;
 
@@ -356,6 +339,7 @@ static void back_cb(void) {
 }
 
 void dice_rolls_page_create(lv_obj_t *parent, void (*return_cb)(void)) {
+  session_cleanup_register(dice_rolls_page_destroy);
   if (!parent)
     return;
 
@@ -384,6 +368,7 @@ void dice_rolls_page_hide(void) {
 }
 
 void dice_rolls_page_destroy(void) {
+  session_cleanup_unregister(dice_rolls_page_destroy);
   cleanup_ui();
 
   if (dice_rolls_screen) {
